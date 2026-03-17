@@ -1,0 +1,104 @@
+# GitHub Actions workflow for the Market Alerts Bot.
+# This runs the bot on a schedule and handles all three scenarios:
+# 1. Opening alert at 9:00 AM IST (3:30 AM UTC)
+# 2. Closing alert at 3:45 PM IST (10:15 AM UTC)
+# 3. Command processing every 15 minutes during market hours
+#
+# GitHub Actions runs in UTC — IST is UTC+5:30, so:
+# 9:00 AM IST = 3:30 AM UTC
+# 3:45 PM IST = 10:15 AM UTC
+
+name: Market Alerts
+
+on:
+  # Scheduled runs (all times are UTC, GitHub Actions uses UTC)
+  schedule:
+    # Opening alert: 9:00 AM IST = 3:30 AM UTC (Mon-Fri)
+    - cron: "30 3 * * 1-5"
+    # Closing alert: 3:45 PM IST = 10:15 AM UTC (Mon-Fri)
+    - cron: "15 10 * * 1-5"
+    # Command processing: every 15 minutes during market hours (4 AM - 12 PM UTC = 9:30 AM - 5:30 PM IST)
+    - cron: "*/15 4-11 * * 1-5"
+
+  # Allow manual triggering from the GitHub Actions tab in your browser
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Run mode"
+        required: true
+        default: "normal"
+        type: choice
+        options:
+          - normal
+          - opening
+          - closing
+          - test
+          - dry-run
+          - commands
+
+jobs:
+  run-alerts:
+    runs-on: ubuntu-latest
+    # Allow this job to read and write to the repository (for watchlist updates)
+    permissions:
+      contents: write
+
+    steps:
+      # Step 1: Download the latest code from your GitHub repository
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Step 2: Set up Python 3.11
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # Step 3: Install all required Python packages
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Step 4: Run the bot
+      # In normal (scheduled) mode, the bot decides what to do based on current time.
+      # In manual mode, it uses whatever you selected from the dropdown.
+      - name: Run market alerts bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          MODE="${{ github.event.inputs.mode }}"
+          if [ -z "$MODE" ] || [ "$MODE" = "normal" ]; then
+            echo "Running in normal (scheduled) mode"
+            python src/main.py
+          elif [ "$MODE" = "opening" ]; then
+            echo "Running forced opening alert"
+            python src/main.py --opening
+          elif [ "$MODE" = "closing" ]; then
+            echo "Running forced closing alert"
+            python src/main.py --closing
+          elif [ "$MODE" = "test" ]; then
+            echo "Running test mode (sends both alerts)"
+            python src/main.py --test
+          elif [ "$MODE" = "dry-run" ]; then
+            echo "Running dry run (prints messages, no Telegram send)"
+            python src/main.py --dry-run
+          elif [ "$MODE" = "commands" ]; then
+            echo "Processing pending commands only"
+            python src/main.py --commands
+          fi
+        working-directory: ${{ github.workspace }}
+
+      # Step 5: If the watchlist was changed by a command (/add or /remove),
+      # commit the updated watchlist back to the repository so it persists.
+      - name: Commit updated watchlist (if changed)
+        run: |
+          git config user.name "market-alerts-bot"
+          git config user.email "bot@market-alerts"
+          git add data/watchlist.json
+          if git diff --staged --quiet; then
+            echo "Watchlist unchanged — nothing to commit"
+          else
+            git commit -m "Update watchlist [skip ci]"
+            git push
+          fi
