@@ -5,6 +5,7 @@
 import os
 import logging
 from datetime import time
+from typing import Optional
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
@@ -31,19 +32,41 @@ OPENING_ALERT_TIME: time = time(9, 0)
 CLOSING_ALERT_TIME: time = time(15, 45)
 
 # --- NSE Indices to always include in every alert ---
-# These are shown at the top of every message regardless of your watchlist
-DEFAULT_INDICES: list[str] = [
-    "^NSEI",    # Nifty 50
-    "^NSEBANK", # Bank Nifty
-    "^CNXIT",   # Nifty IT
+# Each entry is (display_name, nse_api_symbol, yfinance_ticker_fallback)
+#
+# nse_api_symbol: exact name as returned by NSE India's allIndices API
+#   Source: https://www.nseindia.com/api/allIndices
+#   This is the PRIMARY data source — gives real index values, not ETF prices.
+#
+# yfinance_ticker_fallback: used only if the NSE API is unavailable.
+#   Verified working tickers (tested 2026-03-18):
+#     ^NSEI    = Nifty 50        (confirmed: ₹23,581)
+#     ^NSMIDCP = Nifty Next 50  (Yahoo names it "NIFTY NEXT 50", confirmed: ₹65,021)
+#     ^CRSLDX  = Nifty 500      (confirmed: ₹21,669)
+#   Nifty Midcap 150 and Smallcap 250 have NO direct Yahoo Finance index tickers,
+#   so those two fall back to None (NSE API only).
+INDICES_CONFIG: list[tuple[str, str, Optional[str]]] = [
+    ("NIFTY 50",      "NIFTY 50",          "^NSEI"),
+    ("NIFTY NEXT 50", "NIFTY NEXT 50",     "^NSMIDCP"),
+    ("MIDCAP 150",    "NIFTY MIDCAP 150",  None),
+    ("SMALLCAP 250",  "NIFTY SMLCAP 250",  None),
+    ("NIFTY 500",     "NIFTY 500",         "^CRSLDX"),
 ]
 
-# Human-readable names for the indices above
-INDEX_DISPLAY_NAMES: dict[str, str] = {
-    "^NSEI":    "NIFTY 50",
-    "^NSEBANK": "BANK NIFTY",
-    "^CNXIT":   "NIFTY IT",
+# Convenience lookups derived from INDICES_CONFIG
+# nse_symbol → display_name  (used when parsing NSE API response)
+NSE_INDEX_DISPLAY: dict[str, str] = {nse: display for display, nse, _ in INDICES_CONFIG}
+# yfinance_ticker → display_name  (used when falling back to yfinance)
+YF_INDEX_DISPLAY: dict[str, str] = {
+    yf: display for display, _, yf in INDICES_CONFIG if yf is not None
 }
+
+# The ordered list of NSE API symbols we want to fetch
+DEFAULT_NSE_INDICES: list[str] = [nse for _, nse, _ in INDICES_CONFIG]
+
+# Legacy alias kept so formatter.py and other modules that reference
+# INDEX_DISPLAY_NAMES don't break (maps both NSE symbols and YF tickers)
+INDEX_DISPLAY_NAMES: dict[str, str] = {**NSE_INDEX_DISPLAY, **YF_INDEX_DISPLAY}
 
 # --- Retry Settings for Telegram ---
 # If sending a Telegram message fails, we retry this many times
