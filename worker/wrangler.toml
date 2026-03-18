@@ -1,0 +1,24 @@
+# Cloudflare Worker configuration for the Market Alerts Telegram webhook.
+# Deploy with: wrangler deploy
+# Docs: https://developers.cloudflare.com/workers/wrangler/configuration/
+
+name = "market-alerts-bot"
+main = "index.js"
+compatibility_date = "2024-01-01"
+
+# ── Non-secret configuration variables ──────────────────────────────────────
+# These are safe to store in this file (not sensitive).
+# Replace the values below with your actual GitHub username and repo name.
+[vars]
+GITHUB_OWNER = "your-github-username"
+GITHUB_REPO  = "market-alerts"
+
+# ── Secrets (set via CLI, NOT stored here) ───────────────────────────────────
+# Run these three commands once after deploying:
+#
+#   wrangler secret put TELEGRAM_BOT_TOKEN
+#   wrangler secret put TELEGRAM_CHAT_ID
+#   wrangler secret put GITHUB_TOKEN
+#
+# You will be prompted to paste the value for each secret.
+# Secrets are encrypted and stored in Cloudflare — never in this file.
