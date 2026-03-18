@@ -102,7 +102,8 @@ jobs:
         run: |
           git config user.name "market-alerts-bot"
           git config user.email "bot@market-alerts"
-          git add data/watchlist.json data/last_alert.json
+          git add data/watchlist.json
+          if [ -f data/last_alert.json ]; then git add data/last_alert.json; fi
           if git diff --staged --quiet; then
             echo "No data changes — nothing to commit"
           else
