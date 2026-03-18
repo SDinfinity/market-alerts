@@ -3,9 +3,11 @@
 # No emoji, no rupee symbol, no arrow characters — plain text only.
 #
 # Every row is exactly 31 characters wide:
-#   Stocks:  name.ljust(14) + price.rjust(8) + "    " + pct.rjust(5)  = 31
-#   Indices: name.ljust(14) + price.rjust(9) + "   "  + pct.rjust(5)  = 31
+#   Stocks:  name.ljust(15) + price.rjust(8) + "   " + pct.rjust(5)  = 31
+#   Indices: name.ljust(15) + price.rjust(9) + "  "  + pct.rjust(5)  = 31
 #   Divider: "━" * 31
+#
+# Name column is 15 so "NIFTY NEXT 50" (13 chars) has 2 spaces before price.
 
 from datetime import datetime
 from typing import List
@@ -13,12 +15,12 @@ from market_data import StockQuote
 from config import IST, DEFAULT_NSE_INDICES, logger
 
 # Column widths — all rows sum to ROW_WIDTH characters
-STOCK_NAME_W  = 14   # "BHARTIARTL    " — longest watchlist name + padding
+STOCK_NAME_W  = 15   # fits "BHARTIARTL" (10) and "NIFTY NEXT 50" (13) + 2 gap
 STOCK_PRICE_W = 8    # "1,797.00" — max 4-digit price with comma and 2 decimals
-STOCK_SEP     = "    "
-IDX_NAME_W    = 14   # "NIFTY NEXT 50 " — longest index name + padding
+STOCK_SEP     = "   "
+IDX_NAME_W    = 15   # "NIFTY NEXT 50  " — 13 chars + 2 spaces before price
 IDX_PRICE_W   = 9    # "65,021.60" — 5-digit index level with comma and 2 decimals
-IDX_SEP       = "   "
+IDX_SEP       = "  "
 PCT_W         = 5    # "+0.8%" — sign + up to 2 digits + dot + 1 digit + %
 ROW_WIDTH     = STOCK_NAME_W + STOCK_PRICE_W + len(STOCK_SEP) + PCT_W  # = 31
 
@@ -130,7 +132,7 @@ def format_opening_alert(quotes: List[StockQuote], failed_tickers: list) -> str:
         lines.append(_index_row(q.display_name, q.current_price, q.change_pct))
 
     lines.append("")
-    lines.append("Open = 9:15 price \u00b7 Gap = vs prev close")
+    lines.append("Gap = open vs prev close")
 
     stock_failed = [t for t in failed_tickers if t not in _INDEX_SYMBOLS]
     if stock_failed:
@@ -195,7 +197,7 @@ def format_closing_alert(quotes: List[StockQuote], failed_tickers: list) -> str:
         lines.append(_index_row(q.display_name, q.current_price, q.change_pct))
 
     lines.append("")
-    lines.append("Chg = vs prev close")
+    lines.append("Chg = close vs prev close")
 
     stock_failed = [t for t in failed_tickers if t not in _INDEX_SYMBOLS]
     if stock_failed:
