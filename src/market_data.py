@@ -1,21 +1,25 @@
 # This file fetches live stock prices and index levels.
 #
 # DATA SOURCES (in priority order):
-# 1. NSE India allIndices API  — used for all 5 indices (real index values, free, no auth)
-#    URL: https://www.nseindia.com/api/allIndices
-#    Returns actual index levels (e.g., Nifty 50 at 23,581) in one API call.
 #
-# 2. Yahoo Finance (yfinance + direct API fallback) — used for:
-#    - Individual stocks in the watchlist (always)
-#    - Indices if the NSE API is unavailable (partial fallback — only 3 of 5 available)
+# For INDICES (Nifty 50, Next 50, Midcap 150, Smallcap 250, Nifty 500):
+#   Primary:  NSE India allIndices API — https://www.nseindia.com/api/allIndices
+#             Returns official index levels (open, high, low, last, prev_close)
+#             in a single API call. No auth needed.
+#   Fallback: Yahoo Finance direct API (only works for 3 of 5 indices)
 #
+# For STOCKS (watchlist):
+#   Primary:  NSE India quote-equity API — https://www.nseindia.com/api/quote-equity?symbol=INFY
+#             Returns open, high, low, last, prev_close for each stock.
+#   Fallback: Yahoo Finance (yfinance library + direct chart API)
+#
+# A 2-second pause between each stock fetch prevents Yahoo rate-limiting.
 # If a single stock fails, it is skipped and the rest are still sent.
-# A 2-second delay between each Yahoo Finance call prevents rate-limiting (HTTP 429).
 
 import time
 import requests
 import yfinance as yf
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 from config import (
     NSE_SUFFIX,
@@ -26,16 +30,15 @@ from config import (
     logger,
 )
 
-# Small delay between each Yahoo Finance call to avoid being rate-limited
+# 2-second delay between Yahoo Finance calls to avoid HTTP 429 rate-limiting
 FETCH_DELAY_SECONDS = 2.0
 
-# NSE India API — returns all index values in one call, no authentication needed
+# API URLs
 NSE_ALL_INDICES_URL = "https://www.nseindia.com/api/allIndices"
-
-# Yahoo Finance chart API — reliable direct HTTP fallback
+NSE_EQUITY_URL = "https://www.nseindia.com/api/quote-equity?symbol={symbol}"
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 
-# Browser-like headers for both NSE and Yahoo Finance requests
+# Browser-like headers required for NSE India API
 NSE_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -44,10 +47,11 @@ NSE_HEADERS = {
     ),
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate",   # No brotli — not always available in Actions
+    "Accept-Encoding": "gzip, deflate",  # No brotli — not always available in GitHub Actions
     "Referer": "https://www.nseindia.com/",
 }
 
+# Browser-like headers for Yahoo Finance
 YAHOO_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -64,33 +68,46 @@ YAHOO_HEADERS = {
 @dataclass
 class StockQuote:
     """
-    Holds the price data for a single stock or index at a point in time.
-    All price fields are in Indian Rupees (₹).
+    Holds all price data for a single stock or index for one trading day.
+    Used by both the opening alert (shows open + gap) and closing alert
+    (shows close + change + day range).
     """
-    ticker: str           # Identifier used internally (NSE symbol or YF ticker)
-    display_name: str     # Human-readable label shown in the Telegram message
-    current_price: float  # Most recent trading price (or index level)
-    prev_close: float     # Yesterday's closing price
-    change: float         # Absolute change: current - prev_close
-    change_pct: float     # Percentage change from prev_close
-    is_index: bool = False  # True for indices (Nifty 50 etc.), False for stocks
+    ticker: str           # Internal identifier (e.g., "INFY" or "NIFTY 50")
+    display_name: str     # Label shown in the Telegram message
+    current_price: float  # Last traded price — used as "Close" in closing alert
+    prev_close: float     # Previous session's closing price
+    open_price: float     # Day's opening price at 9:15 AM — used in opening alert
+    day_high: float       # Highest price traded today
+    day_low: float        # Lowest price traded today
+    change: float         # Absolute change vs prev_close
+    change_pct: float     # Percentage change vs prev_close
+    is_index: bool = False
+
+    @property
+    def gap_pct(self) -> float:
+        """
+        Gap percentage = how much the stock opened above/below yesterday's close.
+        Used in the morning opening alert to show overnight sentiment.
+        Returns 0 if opening price is not available yet (pre-market).
+        """
+        if self.prev_close == 0 or self.open_price == 0:
+            return 0.0
+        return (self.open_price - self.prev_close) / self.prev_close * 100
 
 
-# ─────────────────────────────────────────────────
-# INDEX FETCHING — NSE API (primary)
-# ─────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────
+# INDEX FETCHING — NSE India allIndices API (primary source)
+# ─────────────────────────────────────────────────────────────────
 
-def fetch_indices_from_nse() -> dict[str, StockQuote]:
+def fetch_indices_from_nse() -> dict:
     """
-    Fetches ALL index values from the NSE India allIndices API in a single call.
+    Fetches all index values from NSE India's allIndices API in one HTTP call.
     Returns a dict mapping NSE index symbol → StockQuote.
-    Example key: "NIFTY 50", "NIFTY MIDCAP 150", "NIFTY SMLCAP 250".
+    Example key: "NIFTY 50", "NIFTY MIDCAP 150", "NIFTY SMLCAP 250"
 
-    This is the primary and preferred source for index data because:
-    - It gives the actual official NSE index values (not ETF prices)
-    - One API call returns everything (efficient)
-    - Free and publicly accessible
-    Returns an empty dict if the API fails, so callers can fall back to yfinance.
+    The allIndices API returns: last, open, high, low, previousClose, percentChange.
+    This is the only source for Midcap 150 and Smallcap 250 index values.
+    Returns empty dict if the API fails (caller will try yfinance fallback).
     """
     try:
         session = requests.Session()
@@ -102,35 +119,37 @@ def fetch_indices_from_nse() -> dict[str, StockQuote]:
 
         data = response.json()
         all_indices = data.get("data", [])
-
         if not all_indices:
-            logger.warning("NSE allIndices API returned empty data list")
+            logger.warning("NSE allIndices API returned empty data")
             return {}
 
-        # Build a lookup: indexSymbol → row  (e.g., "NIFTY 50" → {...})
+        # Build lookup: indexSymbol → row data
         nse_lookup = {row["indexSymbol"]: row for row in all_indices}
 
-        results: dict[str, StockQuote] = {}
+        results = {}
         for nse_symbol in DEFAULT_NSE_INDICES:
             row = nse_lookup.get(nse_symbol)
             if row is None:
-                logger.warning(f"NSE API: '{nse_symbol}' not found in response")
+                logger.warning(f"NSE API: '{nse_symbol}' not in response")
                 continue
 
-            current_price = float(row.get("last", 0))
-            prev_close = float(row.get("previousClose", 0))
+            current_price = float(row.get("last") or 0)
+            prev_close = float(row.get("previousClose") or 0)
+            open_price = float(row.get("open") or 0)
+            day_high = float(row.get("high") or 0)
+            day_low = float(row.get("low") or 0)
 
             if current_price == 0:
-                logger.warning(f"NSE API: zero price returned for '{nse_symbol}'")
+                logger.warning(f"NSE API: zero price for '{nse_symbol}'")
                 continue
 
             change = current_price - prev_close
-            change_pct = (change / prev_close * 100) if prev_close != 0 else 0.0
+            change_pct = float(row.get("percentChange") or 0)
             display_name = NSE_INDEX_DISPLAY.get(nse_symbol, nse_symbol)
 
             logger.info(
-                f"NSE: {display_name}: ₹{current_price:,.2f} "
-                f"({'+' if change >= 0 else ''}{change_pct:.2f}%)"
+                f"NSE index {display_name}: {current_price:,.2f} "
+                f"({change_pct:+.2f}%)"
             )
 
             results[nse_symbol] = StockQuote(
@@ -138,6 +157,9 @@ def fetch_indices_from_nse() -> dict[str, StockQuote]:
                 display_name=display_name,
                 current_price=current_price,
                 prev_close=prev_close,
+                open_price=open_price,
+                day_high=day_high,
+                day_low=day_low,
                 change=change,
                 change_pct=change_pct,
                 is_index=True,
@@ -147,20 +169,138 @@ def fetch_indices_from_nse() -> dict[str, StockQuote]:
         return results
 
     except Exception as e:
-        logger.warning(f"NSE allIndices API failed (will fall back to yfinance): {e}")
+        logger.warning(f"NSE allIndices API failed (will try yfinance fallback): {e}")
         return {}
 
 
-# ─────────────────────────────────────────────────
-# INDIVIDUAL QUOTE FETCHING — Yahoo Finance (primary for stocks, fallback for indices)
-# ─────────────────────────────────────────────────
-
-def fetch_via_yahoo_api(yf_ticker: str) -> Optional[tuple[float, float]]:
+def fetch_index_via_yfinance_fallback(nse_symbol: str) -> Optional[StockQuote]:
     """
-    Fetches current price and previous close directly from the Yahoo Finance
-    chart API using a plain HTTP GET request.
-    Returns (current_price, prev_close) or None if the fetch fails.
-    This is more reliable than the yfinance library when there are rate-limit issues.
+    Fallback for a single index when the NSE allIndices API is down.
+    Uses the mapped yfinance ticker if one exists for this index.
+    Nifty Midcap 150 and Smallcap 250 have no yfinance ticker — they return None.
+    """
+    yf_ticker = None
+    for _, nse, yf_t in INDICES_CONFIG:
+        if nse == nse_symbol:
+            yf_ticker = yf_t
+            break
+
+    if yf_ticker is None:
+        logger.warning(
+            f"No yfinance fallback for '{nse_symbol}' — NSE API is the only source"
+        )
+        return None
+
+    price_data = _fetch_via_yahoo_api(yf_ticker)
+    if price_data is None:
+        price_data = _fetch_via_yfinance_lib(yf_ticker)
+    if price_data is None:
+        return None
+
+    display_name = YF_INDEX_DISPLAY.get(yf_ticker, nse_symbol)
+    return _build_quote(nse_symbol, display_name, price_data, is_index=True)
+
+
+# ─────────────────────────────────────────────────────────────────
+# STOCK FETCHING — NSE equity API (primary) + Yahoo Finance (fallback)
+# ─────────────────────────────────────────────────────────────────
+
+def fetch_stock_from_nse(ticker: str) -> Optional[StockQuote]:
+    """
+    Fetches price data for a single NSE-listed stock using the NSE India
+    quote-equity API. Returns None if the API fails (will fall back to yfinance).
+
+    The API returns: priceInfo with lastPrice, open, previousClose,
+    intraDayHighLow.min/max, pChange.
+    """
+    try:
+        url = NSE_EQUITY_URL.format(symbol=ticker)
+        session = requests.Session()
+        response = session.get(url, headers=NSE_HEADERS, timeout=15)
+
+        if response.status_code != 200:
+            logger.warning(
+                f"NSE equity API returned HTTP {response.status_code} for {ticker}"
+            )
+            return None
+
+        data = response.json()
+        pi = data.get("priceInfo", {})
+
+        current_price = float(pi.get("lastPrice") or pi.get("close") or 0)
+        prev_close = float(pi.get("previousClose") or pi.get("basePrice") or 0)
+        open_price = float(pi.get("open") or 0)
+        intraday = pi.get("intraDayHighLow", {}) or {}
+        day_high = float(intraday.get("max") or 0)
+        day_low = float(intraday.get("min") or 0)
+        change_pct = float(pi.get("pChange") or 0)
+
+        if current_price == 0:
+            logger.warning(f"NSE equity API: zero price for {ticker}")
+            return None
+
+        change = current_price - prev_close
+
+        logger.info(
+            f"NSE stock {ticker}: {current_price:,.2f} "
+            f"({change_pct:+.2f}%)"
+        )
+
+        return StockQuote(
+            ticker=ticker,
+            display_name=ticker,
+            current_price=current_price,
+            prev_close=prev_close,
+            open_price=open_price,
+            day_high=day_high,
+            day_low=day_low,
+            change=change,
+            change_pct=change_pct,
+            is_index=False,
+        )
+
+    except Exception as e:
+        logger.warning(f"NSE equity API failed for {ticker}: {e}")
+        return None
+
+
+def fetch_stock_quote(ticker: str) -> Optional[StockQuote]:
+    """
+    Fetches the current price for a single NSE-listed stock (e.g., "INFY").
+    Tries NSE equity API first, then falls back to Yahoo Finance.
+    Returns None if all methods fail — the stock is skipped, not a crash.
+    """
+    # Try NSE equity API first (has open, high, low — full data)
+    quote = fetch_stock_from_nse(ticker)
+    if quote:
+        return quote
+
+    logger.warning(f"NSE equity API failed for {ticker} — trying Yahoo Finance fallback")
+
+    # Yahoo Finance needs ".NS" suffix for NSE stocks
+    yf_ticker = f"{ticker}{NSE_SUFFIX}"
+
+    price_data = _fetch_via_yahoo_api(yf_ticker)
+    if price_data is None:
+        price_data = _fetch_via_yfinance_lib(yf_ticker)
+
+    if price_data is None:
+        logger.error(f"All fetch methods failed for {ticker}")
+        return None
+
+    return _build_quote(ticker, ticker, price_data, is_index=False)
+
+
+# ─────────────────────────────────────────────────────────────────
+# YAHOO FINANCE HELPERS (used as fallback for both stocks and indices)
+# ─────────────────────────────────────────────────────────────────
+
+def _fetch_via_yahoo_api(yf_ticker: str) -> Optional[dict]:
+    """
+    Fetches price data via a direct HTTP GET to the Yahoo Finance chart API.
+    Returns a dict with current_price, prev_close, open_price, day_high, day_low.
+    Returns None if the fetch fails.
+    This is more reliable than the yfinance library when there are 429 errors.
     """
     try:
         url = YAHOO_CHART_URL.format(symbol=yf_ticker)
@@ -172,182 +312,130 @@ def fetch_via_yahoo_api(yf_ticker: str) -> Optional[tuple[float, float]]:
 
         data = response.json()
         result = data.get("chart", {}).get("result", [])
-
         if not result:
-            logger.warning(f"Yahoo API: no data in response for {yf_ticker}")
             return None
 
         meta = result[0].get("meta", {})
-        current_price = meta.get("regularMarketPrice") or meta.get("chartPreviousClose")
+        current_price = meta.get("regularMarketPrice")
         prev_close = meta.get("chartPreviousClose") or meta.get("previousClose")
 
         if current_price is None or prev_close is None:
-            logger.warning(f"Yahoo API: missing price fields for {yf_ticker}")
             return None
 
-        return float(current_price), float(prev_close)
+        return {
+            "current_price": float(current_price),
+            "prev_close": float(prev_close),
+            "open_price": float(meta.get("regularMarketOpen") or 0),
+            "day_high": float(meta.get("regularMarketDayHigh") or 0),
+            "day_low": float(meta.get("regularMarketDayLow") or 0),
+        }
 
-    except (requests.RequestException, ValueError, KeyError) as e:
-        logger.warning(f"Yahoo API direct fetch failed for {yf_ticker}: {e}")
+    except Exception as e:
+        logger.debug(f"Yahoo direct API failed for {yf_ticker}: {e}")
         return None
 
 
-def fetch_via_yfinance(yf_ticker: str) -> Optional[tuple[float, float]]:
+def _fetch_via_yfinance_lib(yf_ticker: str) -> Optional[dict]:
     """
-    Fetches price using the yfinance library (tried first before direct API).
-    Returns (current_price, prev_close) or None if the fetch fails.
+    Fetches price data using the yfinance Python library.
+    Returns a dict with current_price, prev_close, open_price, day_high, day_low.
+    Returns None if the fetch fails.
     """
     try:
         stock = yf.Ticker(yf_ticker)
-        info = stock.fast_info
+        fi = stock.fast_info
 
-        current_price = getattr(info, "last_price", None)
-        prev_close = getattr(info, "previous_close", None)
+        current_price = getattr(fi, "last_price", None)
+        prev_close = getattr(fi, "previous_close", None)
 
-        if current_price is not None and prev_close is not None:
-            return float(current_price), float(prev_close)
+        if current_price is None or prev_close is None:
+            return None
 
-        return None
+        return {
+            "current_price": float(current_price),
+            "prev_close": float(prev_close),
+            "open_price": float(getattr(fi, "open", None) or 0),
+            "day_high": float(getattr(fi, "day_high", None) or 0),
+            "day_low": float(getattr(fi, "day_low", None) or 0),
+        }
 
     except Exception as e:
-        logger.debug(f"yfinance failed for {yf_ticker}: {e}")
+        logger.debug(f"yfinance lib failed for {yf_ticker}: {e}")
         return None
 
 
-def fetch_stock_quote(ticker: str) -> Optional[StockQuote]:
+def _build_quote(
+    ticker: str, display_name: str, price_data: dict, is_index: bool
+) -> StockQuote:
     """
-    Fetches the current price for a single NSE-listed stock (e.g., "INFY").
-    Adds ".NS" to the ticker for Yahoo Finance (e.g., "INFY.NS").
-    Tries yfinance first, then falls back to the direct Yahoo Finance chart API.
-    Returns None if all methods fail (stock is skipped, not a crash).
+    Builds a StockQuote from a price data dict returned by Yahoo Finance helpers.
     """
-    yf_ticker = f"{ticker}{NSE_SUFFIX}"
-
-    # Try yfinance first (usually faster when not rate-limited)
-    prices = fetch_via_yfinance(yf_ticker)
-
-    # Fall back to direct API call
-    if prices is None:
-        logger.debug(f"yfinance failed for {yf_ticker}, trying direct API...")
-        prices = fetch_via_yahoo_api(yf_ticker)
-
-    if prices is None:
-        logger.error(f"All fetch methods failed for {ticker} ({yf_ticker})")
-        return None
-
-    current_price, prev_close = prices
+    current_price = price_data["current_price"]
+    prev_close = price_data["prev_close"]
     change = current_price - prev_close
     change_pct = (change / prev_close * 100) if prev_close != 0 else 0.0
 
     logger.info(
-        f"Fetched {ticker}: ₹{current_price:,.2f} "
-        f"({'+' if change >= 0 else ''}{change_pct:.2f}%)"
+        f"YF {'index' if is_index else 'stock'} {display_name}: "
+        f"{current_price:,.2f} ({change_pct:+.2f}%)"
     )
 
     return StockQuote(
         ticker=ticker,
-        display_name=ticker,
-        current_price=current_price,
-        prev_close=prev_close,
-        change=change,
-        change_pct=change_pct,
-        is_index=False,
-    )
-
-
-def fetch_index_via_yfinance_fallback(nse_symbol: str) -> Optional[StockQuote]:
-    """
-    Fallback for a single index when the NSE API is down.
-    Uses the yfinance ticker mapped to this NSE index symbol (if one exists).
-    Nifty Midcap 150 and Smallcap 250 have no yfinance ticker, so they return None.
-    """
-    # Find the yfinance ticker for this NSE index symbol
-    yf_ticker = None
-    for _, nse, yf in INDICES_CONFIG:
-        if nse == nse_symbol:
-            yf_ticker = yf
-            break
-
-    if yf_ticker is None:
-        logger.warning(
-            f"No yfinance fallback ticker for '{nse_symbol}' — "
-            f"this index is NSE API only"
-        )
-        return None
-
-    prices = fetch_via_yfinance(yf_ticker)
-    if prices is None:
-        prices = fetch_via_yahoo_api(yf_ticker)
-    if prices is None:
-        return None
-
-    current_price, prev_close = prices
-    change = current_price - prev_close
-    change_pct = (change / prev_close * 100) if prev_close != 0 else 0.0
-    display_name = YF_INDEX_DISPLAY.get(yf_ticker, nse_symbol)
-
-    logger.info(
-        f"YF fallback {display_name}: ₹{current_price:,.2f} "
-        f"({'+' if change >= 0 else ''}{change_pct:.2f}%)"
-    )
-
-    return StockQuote(
-        ticker=nse_symbol,
         display_name=display_name,
         current_price=current_price,
         prev_close=prev_close,
+        open_price=price_data.get("open_price", 0.0),
+        day_high=price_data.get("day_high", 0.0),
+        day_low=price_data.get("day_low", 0.0),
         change=change,
         change_pct=change_pct,
-        is_index=True,
+        is_index=is_index,
     )
 
 
-# ─────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────
 # MAIN ENTRY POINT
-# ─────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────
 
-def fetch_all_quotes(watchlist: list[str]) -> tuple[list[StockQuote], list[str]]:
+def fetch_all_quotes(watchlist: list) -> tuple:
     """
-    Fetches price data for all 5 indices and all stocks in your watchlist.
+    Fetches price data for all 5 indices and all stocks in the watchlist.
 
-    For indices:  NSE allIndices API (one call) → yfinance per-index fallback
-    For stocks:   yfinance → direct Yahoo API fallback
+    Indices:  NSE allIndices API (one call) → yfinance per-index fallback
+    Stocks:   NSE equity API → Yahoo Finance fallback, with 2s delay between calls
 
     Returns:
-    - List of StockQuote objects (indices first, then watchlist stocks)
-    - List of tickers that completely failed (for warning in the alert message)
+      - List of StockQuote objects (indices first, then watchlist stocks in order)
+      - List of tickers that completely failed to fetch
     """
-    successful_quotes: list[StockQuote] = []
-    failed_tickers: list[str] = []
+    successful_quotes = []
+    failed_tickers = []
 
-    # ── Step 1: Fetch all indices from NSE in one shot ──
-    logger.info("Fetching indices from NSE India API...")
-    nse_results = fetch_indices_from_nse()
+    # ── Step 1: Fetch all 5 indices from NSE in one call ──
+    logger.info("Fetching indices from NSE India allIndices API...")
+    nse_index_results = fetch_indices_from_nse()
 
-    # For each required index, use NSE result or fall back to yfinance
     for _, nse_symbol, _ in INDICES_CONFIG:
-        if nse_symbol in nse_results:
-            successful_quotes.append(nse_results[nse_symbol])
+        if nse_symbol in nse_index_results:
+            successful_quotes.append(nse_index_results[nse_symbol])
         else:
-            logger.warning(
-                f"NSE API missed '{nse_symbol}' — trying yfinance fallback..."
-            )
+            logger.warning(f"Trying yfinance fallback for index '{nse_symbol}'...")
             fallback = fetch_index_via_yfinance_fallback(nse_symbol)
             if fallback:
                 successful_quotes.append(fallback)
             else:
                 failed_tickers.append(nse_symbol)
 
-    # ── Step 2: Fetch each watchlist stock from Yahoo Finance ──
+    # ── Step 2: Fetch each watchlist stock ──
     if watchlist:
-        logger.info(f"Fetching {len(watchlist)} stocks from watchlist...")
+        logger.info(f"Fetching {len(watchlist)} watchlist stocks...")
         for ticker in watchlist:
             quote = fetch_stock_quote(ticker)
             if quote:
                 successful_quotes.append(quote)
             else:
                 failed_tickers.append(ticker)
-            # 2-second pause to avoid Yahoo Finance rate-limiting (HTTP 429)
             time.sleep(FETCH_DELAY_SECONDS)
     else:
         logger.info("Watchlist is empty — only sending index data")
@@ -359,11 +447,11 @@ def fetch_all_quotes(watchlist: list[str]) -> tuple[list[StockQuote], list[str]]
     return successful_quotes, failed_tickers
 
 
-def validate_ticker(ticker: str) -> tuple[bool, Optional[float]]:
+def validate_ticker(ticker: str) -> tuple:
     """
-    Checks if a ticker symbol is valid by trying to fetch its current price.
-    Returns (True, price) if valid, (False, None) if the ticker doesn't exist.
-    Used when someone types /add SOMESTOCK to verify it before saving.
+    Checks if a ticker symbol is valid by fetching its current price.
+    Returns (True, price) if valid, (False, None) if not found.
+    Used by /add command to verify a ticker before saving it.
     """
     quote = fetch_stock_quote(ticker)
     if quote and quote.current_price > 0:

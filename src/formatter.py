@@ -1,188 +1,264 @@
-# This file formats the stock price data into nicely aligned Telegram messages.
-# Telegram supports HTML formatting — we use <pre> tags for monospace text
-# so the columns line up perfectly on both mobile and desktop.
-# All prices are in Indian Rupees (₹) with 2 decimal places.
+# This file formats stock and index price data into Telegram messages.
+# The entire message is wrapped in <pre> tags so all columns align in monospace.
+# No emoji, no rupee symbol, no arrow characters — plain text only.
+#
+# Opening alert format: stocks sorted by gap% (open vs prev close), indices below
+# Closing alert format: stocks sorted by change%, with day range column, indices below
 
 from datetime import datetime
+from typing import List
 from market_data import StockQuote
-from config import IST, MARKET_OPEN_TIME, MARKET_CLOSE_TIME, logger
+from config import IST, DEFAULT_NSE_INDICES, logger
 
+# Set of all NSE index symbols — used to filter them out of "failed" warnings
+_INDEX_SYMBOLS = set(DEFAULT_NSE_INDICES)
 
-def format_change_arrow(change_pct: float) -> str:
+# ─────────────────────────────────────────────────────────────────
+# Number formatting helpers
+# ─────────────────────────────────────────────────────────────────
+
+def _fmt_price(value: float) -> str:
     """
-    Returns a directional arrow emoji based on whether the stock went up or down.
-    Green up arrow for gains, red down arrow for losses, dash for flat.
+    Formats a price or index level with commas and 2 decimal places.
+    Examples: 1234.5 → "1,234.50",  23581.15 → "23,581.15"
     """
-    if change_pct > 0:
-        return "▲"
-    elif change_pct < 0:
-        return "▼"
-    return "─"
+    return f"{value:,.2f}"
 
 
-def format_price_row(quote: StockQuote, name_width: int = 14) -> str:
+def _fmt_pct(pct: float) -> str:
     """
-    Formats a single stock or index as one row of the price table.
-    Columns: Name | Price | Change% | Arrow
-    The name_width parameter ensures all names are padded to the same length
-    so the price column lines up correctly in monospace.
-
-    Example output: "INFY          1,891.25   +1.23% ▲"
+    Formats a percentage with sign and 1 decimal place.
+    Examples: 2.137 → "+2.1%",  -0.3 → "-0.3%",  0.0 → "+0.0%"
     """
-    arrow = format_change_arrow(quote.change_pct)
-    sign = "+" if quote.change_pct >= 0 else ""
-
-    # Truncate long names to fit the column width
-    name = quote.display_name[:name_width].ljust(name_width)
-    price = f"₹{quote.current_price:>10,.2f}"
-    change = f"{sign}{quote.change_pct:>6.2f}%"
-
-    return f"{name} {price}  {change} {arrow}"
+    return f"{pct:+.1f}%"
 
 
-def format_opening_alert(
-    quotes: list[StockQuote],
-    failed_tickers: list[str],
-) -> str:
+def _fmt_range_val(value: float) -> str:
     """
-    Creates the morning opening alert message.
-    Shows the previous day's closing prices and sets context for the trading day.
-    This is sent around 9:00 AM IST, before the market opens at 9:15 AM.
-
-    The message uses HTML formatting for Telegram with <pre> for alignment.
+    Formats a range endpoint (day high or low) with appropriate precision.
+    - Values below 100: 1 decimal place (e.g., 84.3)
+    - Values 100 and above: rounded to nearest integer (e.g., 1,640)
+    - Values 10,000 and above: rounded to nearest 10 (e.g., 23,380)
     """
-    now = datetime.now(tz=IST)
-    date_str = now.strftime("%d %b %Y")  # e.g., "17 Mar 2026"
-    open_time = MARKET_OPEN_TIME.strftime("%I:%M %p")  # "09:15 AM"
-
-    # Split quotes into indices and watchlist stocks
-    indices = [q for q in quotes if q.is_index]
-    stocks = [q for q in quotes if not q.is_index]
-
-    # Find the longest name for alignment
-    all_names = [q.display_name for q in quotes]
-    name_width = max((len(n) for n in all_names), default=10)
-    name_width = min(name_width, 16)  # Cap at 16 so it doesn't get too wide
-
-    lines = [
-        f"<b>🌅 Market Opening Alert — {date_str}</b>",
-        f"Market opens at {open_time} IST",
-        "",
-        "<pre>",
-        "── INDICES ─────────────────────────────",
-    ]
-
-    for q in indices:
-        lines.append(format_price_row(q, name_width))
-
-    if stocks:
-        lines.append("")
-        lines.append("── YOUR WATCHLIST ───────────────────────")
-        for q in stocks:
-            lines.append(format_price_row(q, name_width))
-
-    lines.append("</pre>")
-
-    if failed_tickers:
-        clean_failed = [t for t in failed_tickers if not t.startswith("^")]
-        if clean_failed:
-            lines.append(f"\n⚠️ Could not fetch: {', '.join(clean_failed)}")
-
-    if not stocks:
-        lines.append(
-            "\n💡 <i>Tip: Use /add TICKER to add stocks to your watchlist</i>"
-        )
-
-    return "\n".join(lines)
-
-
-def format_closing_alert(
-    quotes: list[StockQuote],
-    failed_tickers: list[str],
-) -> str:
-    """
-    Creates the evening closing alert message.
-    Shows the final closing prices for the day with gains/losses.
-    This is sent around 3:45 PM IST, after the market closes at 3:30 PM.
-    """
-    now = datetime.now(tz=IST)
-    date_str = now.strftime("%d %b %Y")
-
-    indices = [q for q in quotes if q.is_index]
-    stocks = [q for q in quotes if not q.is_index]
-
-    all_names = [q.display_name for q in quotes]
-    name_width = max((len(n) for n in all_names), default=10)
-    name_width = min(name_width, 16)
-
-    # Compute overall market sentiment from Nifty 50
-    nifty = next((q for q in indices if q.ticker == "^NSEI"), None)
-    if nifty:
-        if nifty.change_pct >= 1.0:
-            sentiment = "📈 Strong day for the market!"
-        elif nifty.change_pct >= 0:
-            sentiment = "📊 Market closed slightly higher."
-        elif nifty.change_pct >= -1.0:
-            sentiment = "📉 Market closed slightly lower."
-        else:
-            sentiment = "📉 Rough day for the market."
+    if value < 100:
+        return f"{value:,.1f}"
+    elif value < 10000:
+        return f"{int(round(value)):,}"
     else:
-        sentiment = "📊 Market has closed."
+        # Round to nearest 10 for large index values
+        return f"{int(round(value / 10) * 10):,}"
 
-    lines = [
-        f"<b>🔔 Market Closing Alert — {date_str}</b>",
-        sentiment,
-        "",
-        "<pre>",
-        "── INDICES ─────────────────────────────",
-    ]
 
-    for q in indices:
-        lines.append(format_price_row(q, name_width))
+def _fmt_range(low: float, high: float) -> str:
+    """
+    Formats the day's trading range as "low – high".
+    Returns empty string if either value is zero (data not available).
+    Examples: "1,640 – 1,658",  "238.9 – 246.1",  "23,380 – 23,470"
+    """
+    if low == 0 or high == 0:
+        return ""
+    return f"{_fmt_range_val(low)} \u2013 {_fmt_range_val(high)}"
 
-    if stocks:
-        lines.append("")
-        lines.append("── YOUR WATCHLIST ───────────────────────")
-        for q in stocks:
-            lines.append(format_price_row(q, name_width))
 
-        # Highlight the top gainer and loser in the watchlist
-        if len(stocks) >= 2:
-            top_gainer = max(stocks, key=lambda q: q.change_pct)
-            top_loser = min(stocks, key=lambda q: q.change_pct)
-            lines.append("")
-            lines.append(
-                f"🏆 Best:  {top_gainer.display_name} ({top_gainer.change_pct:+.2f}%)"
-            )
-            lines.append(
-                f"💔 Worst: {top_loser.display_name} ({top_loser.change_pct:+.2f}%)"
-            )
+# ─────────────────────────────────────────────────────────────────
+# Opening alert
+# ─────────────────────────────────────────────────────────────────
 
-    lines.append("</pre>")
+def format_opening_alert(quotes: List[StockQuote], failed_tickers: list) -> str:
+    """
+    Formats the morning opening alert message.
+    Stocks are sorted by gap% (open price vs prev close) from highest to lowest.
+    Indices are shown below in fixed order (Nifty 50 first, Nifty 500 last).
 
-    if failed_tickers:
-        clean_failed = [t for t in failed_tickers if not t.startswith("^")]
-        if clean_failed:
-            lines.append(f"\n⚠️ Could not fetch: {', '.join(clean_failed)}")
+    Sent around 9:30 AM IST — 15 minutes after market opens, so opening prices
+    are available. If open_price is zero for a stock, falls back to prev_close.
 
-    if not stocks:
+    The entire message is wrapped in <pre> tags for monospace alignment.
+    """
+    now = datetime.now(tz=IST)
+    # "Wednesday, 18 Mar 2026"
+    date_str = now.strftime("%A, %d %b %Y")
+
+    indices = [q for q in quotes if q.is_index]
+    stocks = [q for q in quotes if not q.is_index]
+
+    # Sort stocks by gap% descending (best gap at top)
+    # Fall back to change_pct if open_price is not available
+    stocks_sorted = sorted(
+        stocks,
+        key=lambda q: q.gap_pct if q.open_price > 0 else q.change_pct,
+        reverse=True,
+    )
+
+    # Column widths for the stocks section
+    # Name: left-aligned to 14 chars (BHARTIARTL = 10, plus buffer)
+    # Open: right-aligned to 10 chars (handles "1,648.50" = 8 chars with padding)
+    # Gap: right-aligned to 7 chars (handles "+10.5%" = 6 chars)
+    NAME_W = 14
+    PRICE_W = 10
+    PCT_W = 7
+
+    # Column widths for the indices section (longer names, larger numbers)
+    # Name: left-aligned to 15 chars (NIFTY NEXT 50 = 13)
+    # Level: right-aligned to 11 chars (handles "65,021.60" = 9 chars with padding)
+    # Pct: right-aligned to 7 chars
+    IDX_NAME_W = 15
+    IDX_PRICE_W = 11
+    IDX_PCT_W = 7
+
+    stock_header = (
+        f"{'Ticker':<{NAME_W}}"
+        f"{'Open':>{PRICE_W}}"
+        f"{'Gap':>{PCT_W + 4}}"
+    )
+    stock_divider = "\u2501" * (NAME_W + PRICE_W + PCT_W + 4)
+
+    idx_header_line = "Indices"
+
+    lines = ["<pre>"]
+    lines.append(f"Market open \u2014 {date_str}")
+    lines.append("Opening prices \u00b7 sorted by gap high \u2192 low")
+    lines.append("")
+    lines.append(stock_header)
+    lines.append(stock_divider)
+
+    for q in stocks_sorted:
+        # Use opening price if available, otherwise prev_close
+        display_price = q.open_price if q.open_price > 0 else q.prev_close
+        gap = q.gap_pct if q.open_price > 0 else q.change_pct
         lines.append(
-            "\n💡 <i>Tip: Use /add TICKER to add stocks to your watchlist</i>"
+            f"{q.display_name:<{NAME_W}}"
+            f"{_fmt_price(display_price):>{PRICE_W}}"
+            f"    "
+            f"{_fmt_pct(gap):>{PCT_W}}"
         )
 
+    # Indices section (no gap column — just level and % change from prev close)
+    if indices:
+        lines.append("")
+        lines.append(idx_header_line)
+        for q in indices:
+            lines.append(
+                f"{q.display_name:<{IDX_NAME_W}}"
+                f"{_fmt_price(q.current_price):>{IDX_PRICE_W}}"
+                f"   "
+                f"{_fmt_pct(q.change_pct):>{IDX_PCT_W}}"
+            )
+
+    lines.append("")
+    lines.append("Open = 9:15 opening price \u00b7 Gap = open vs prev close")
+
+    # Only warn about failed STOCKS — index failures are expected when NSE API is down
+    stock_failed = [t for t in failed_tickers if t not in _INDEX_SYMBOLS]
+    if stock_failed:
+        lines.append(f"Could not fetch: {', '.join(stock_failed)}")
+
+    lines.append("</pre>")
     return "\n".join(lines)
 
+
+# ─────────────────────────────────────────────────────────────────
+# Closing alert
+# ─────────────────────────────────────────────────────────────────
+
+def format_closing_alert(quotes: List[StockQuote], failed_tickers: list) -> str:
+    """
+    Formats the evening closing alert message.
+    Stocks are sorted by change% (best performers at top).
+    Each row shows close price, % change, and the day's trading range.
+    Indices are shown below in fixed order with their range.
+
+    Sent around 3:45 PM IST — 15 minutes after market closes.
+
+    The entire message is wrapped in <pre> tags for monospace alignment.
+    """
+    now = datetime.now(tz=IST)
+    date_str = now.strftime("%A, %d %b %Y")
+
+    indices = [q for q in quotes if q.is_index]
+    stocks = [q for q in quotes if not q.is_index]
+
+    # Sort stocks by change% descending (best performers at top)
+    stocks_sorted = sorted(stocks, key=lambda q: q.change_pct, reverse=True)
+
+    # Column widths for stocks section
+    NAME_W = 14
+    CLOSE_W = 10
+    CHG_W = 7
+
+    # Column widths for indices section
+    IDX_NAME_W = 15
+    IDX_CLOSE_W = 11
+    IDX_CHG_W = 7
+
+    stock_header = (
+        f"{'Ticker':<{NAME_W}}"
+        f"{'Close':>{CLOSE_W}}"
+        f"{'Chg':>{CHG_W + 4}}"
+        f"   Range"
+    )
+    stock_divider = "\u2501" * (NAME_W + CLOSE_W + CHG_W + 4 + 3 + 15)
+
+    lines = ["<pre>"]
+    lines.append(f"Market close \u2014 {date_str}")
+    lines.append("Sorted best \u2192 worst")
+    lines.append("")
+    lines.append(stock_header)
+    lines.append(stock_divider)
+
+    for q in stocks_sorted:
+        rng = _fmt_range(q.day_low, q.day_high)
+        range_str = f"   {rng}" if rng else ""
+        lines.append(
+            f"{q.display_name:<{NAME_W}}"
+            f"{_fmt_price(q.current_price):>{CLOSE_W}}"
+            f"    "
+            f"{_fmt_pct(q.change_pct):>{CHG_W}}"
+            f"{range_str}"
+        )
+
+    # Indices section with range
+    if indices:
+        lines.append("")
+        lines.append("Indices")
+        for q in indices:
+            rng = _fmt_range(q.day_low, q.day_high)
+            range_str = f"   {rng}" if rng else ""
+            lines.append(
+                f"{q.display_name:<{IDX_NAME_W}}"
+                f"{_fmt_price(q.current_price):>{IDX_CLOSE_W}}"
+                f"   "
+                f"{_fmt_pct(q.change_pct):>{IDX_CHG_W}}"
+                f"{range_str}"
+            )
+
+    lines.append("")
+    lines.append(
+        "Chg = vs prev session close \u00b7 Range = day low \u2013 high"
+    )
+
+    # Only warn about failed STOCKS — index failures are expected when NSE API is down
+    stock_failed = [t for t in failed_tickers if t not in _INDEX_SYMBOLS]
+    if stock_failed:
+        lines.append(f"Could not fetch: {', '.join(stock_failed)}")
+
+    lines.append("</pre>")
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────────
+# Failure alert
+# ─────────────────────────────────────────────────────────────────
 
 def format_failure_alert() -> str:
     """
-    Creates an alert message to send when ALL stock fetches have failed.
-    This lets you know the bot is running but can't get data.
+    Sent when ALL data fetches fail — lets you know the bot ran but got no data.
     """
     now = datetime.now(tz=IST)
     return (
-        f"⚠️ <b>Market Alert — Data Fetch Failed</b>\n\n"
+        f"<pre>Market alert failed\n\n"
         f"Could not fetch any market data at "
         f"{now.strftime('%I:%M %p IST on %d %b %Y')}.\n\n"
-        f"This may be a temporary issue with Yahoo Finance. "
-        f"Please check the market manually."
+        f"Possible cause: Yahoo Finance or NSE API is temporarily unavailable.\n"
+        f"Please check the market manually.</pre>"
     )

@@ -26,9 +26,10 @@ TELEGRAM_CHAT_ID: str = os.environ.get("TELEGRAM_CHAT_ID", "")
 MARKET_OPEN_TIME: time = time(9, 15)
 MARKET_CLOSE_TIME: time = time(15, 30)
 
-# How many minutes before open/after close we send the alert
-# e.g. opening alert at 9:00 AM, closing alert at 3:45 PM
-OPENING_ALERT_TIME: time = time(9, 0)
+# Opening alert is at 9:30 AM IST — 15 minutes after the market opens at 9:15 AM.
+# This ensures opening prices are available when we fetch them.
+# Closing alert is at 3:45 PM IST — 15 minutes after market closes at 3:30 PM.
+OPENING_ALERT_TIME: time = time(9, 30)
 CLOSING_ALERT_TIME: time = time(15, 45)
 
 # --- NSE Indices to always include in every alert ---
