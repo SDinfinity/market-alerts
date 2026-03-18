@@ -135,22 +135,16 @@ def get_alert_type() -> Optional[str]:
     now = datetime.now(tz=IST)
     current_time = now.time()
 
-    # Allow a 10-minute window around each alert time (in case Actions runs late)
-    from datetime import timedelta
+    # Opening window: 8:45 AM – 9:45 AM IST
+    # Matches crons "15-59/3 3 * * 1-5" and "0-3 4 * * 1-5"
+    from datetime import time as time_
+    opening_start = time_(8, 45)
+    opening_end   = time_(9, 45)
 
-    opening_start = (
-        datetime.combine(now.date(), OPENING_ALERT_TIME) - timedelta(minutes=5)
-    ).time()
-    opening_end = (
-        datetime.combine(now.date(), OPENING_ALERT_TIME) + timedelta(minutes=15)
-    ).time()
-
-    closing_start = (
-        datetime.combine(now.date(), CLOSING_ALERT_TIME) - timedelta(minutes=5)
-    ).time()
-    closing_end = (
-        datetime.combine(now.date(), CLOSING_ALERT_TIME) + timedelta(minutes=15)
-    ).time()
+    # Closing window: 3:15 PM – 4:16 PM IST
+    # Matches crons "45-59/3 9 * * 1-5" and "0-45/3 10 * * 1-5"
+    closing_start = time_(15, 15)
+    closing_end   = time_(16, 16)
 
     if opening_start <= current_time <= opening_end:
         return "opening"

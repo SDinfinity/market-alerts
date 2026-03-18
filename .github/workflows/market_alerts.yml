@@ -1,27 +1,30 @@
 # GitHub Actions workflow for the Market Alerts Bot.
-# This runs the bot on a schedule and handles all three scenarios:
-# 1. Opening alert targeting 9:17 AM IST delivery:
-#    Cron fires at 9:12 AM IST (3:42 AM UTC) to allow for GitHub startup delay.
-#    The script then sleeps until exactly 9:17 AM IST before fetching and sending.
-# 2. Closing alert at 3:45 PM IST (10:15 AM UTC)
-# 3. Command processing every 15 minutes during market hours
+# Runs frequent crons during two wide windows to survive GitHub scheduler delays.
 #
-# GitHub Actions runs in UTC — IST is UTC+5:30, so:
-# 9:12 AM IST = 3:42 AM UTC
-# 3:45 PM IST = 10:15 AM UTC
+# Opening window: every 3 min, 3:15–3:59 AM UTC + 4:00–4:03 AM UTC
+#   = 8:45–9:33 AM IST (market opens 9:15 AM IST, alert fires at 9:17 AM IST)
+#   Script sleeps inside until 9:17 AM IST if it starts early.
+#   Deduplication via data/last_alert.json prevents double-sends.
+#
+# Closing window: every 3 min, 9:45–9:59 AM UTC + 10:00–10:45 AM UTC
+#   = 3:15–4:15 PM IST (market closes 3:30 PM IST, alert fires at 4:00 PM IST)
+#   Script sleeps inside until 4:00 PM IST if it starts early.
+#
+# Telegram commands are handled entirely by the Cloudflare Worker (webhook).
+# GitHub Actions no longer polls for commands.
 
 name: Market Alerts
 
 on:
-  # Scheduled runs (all times are UTC, GitHub Actions uses UTC)
   schedule:
-    # Opening alert: fires at 9:12 AM IST = 3:42 AM UTC (Mon-Fri)
-    # Script sleeps inside until 9:17 AM IST before fetching data
-    - cron: "42 3 * * 1-5"
-    # Closing alert: 3:45 PM IST = 10:15 AM UTC (Mon-Fri)
-    - cron: "15 10 * * 1-5"
-    # Command processing: every 15 minutes during market hours (4 AM - 12 PM UTC = 9:30 AM - 5:30 PM IST)
-    - cron: "*/15 4-11 * * 1-5"
+    # Opening window: every 3 min from 3:15 to 3:59 AM UTC (8:45–9:29 AM IST)
+    - cron: "15-59/3 3 * * 1-5"
+    # Opening window continued: 4:00–4:03 AM UTC (9:30–9:33 AM IST)
+    - cron: "0-3 4 * * 1-5"
+    # Closing window: every 3 min from 9:45 to 9:59 AM UTC (3:15–3:29 PM IST)
+    - cron: "45-59/3 9 * * 1-5"
+    # Closing window continued: every 3 min from 10:00 to 10:45 AM UTC (3:30–4:15 PM IST)
+    - cron: "0-45/3 10 * * 1-5"
 
   # Allow manual triggering from the GitHub Actions tab in your browser
   workflow_dispatch:
@@ -42,7 +45,7 @@ on:
 jobs:
   run-alerts:
     runs-on: ubuntu-latest
-    # Allow this job to read and write to the repository (for watchlist updates)
+    # Allow this job to read and write to the repository (for watchlist and dedup updates)
     permissions:
       contents: write
 
@@ -87,21 +90,22 @@ jobs:
             echo "Running dry run (prints messages, no Telegram send)"
             python src/main.py --dry-run
           elif [ "$MODE" = "commands" ]; then
-            echo "Processing pending commands only"
+            echo "Commands are handled by Cloudflare Worker — nothing to do"
             python src/main.py --commands
           fi
         working-directory: ${{ github.workspace }}
 
-      # Step 5: If the watchlist was changed by a command (/add or /remove),
-      # commit the updated watchlist back to the repository so it persists.
-      - name: Commit updated watchlist (if changed)
+      # Step 5: Commit data files back to the repo so they persist across runs.
+      # - data/watchlist.json: updated by /add and /remove commands
+      # - data/last_alert.json: deduplication state (which alerts were sent today)
+      - name: Commit data files (if changed)
         run: |
           git config user.name "market-alerts-bot"
           git config user.email "bot@market-alerts"
-          git add data/watchlist.json
+          git add data/watchlist.json data/last_alert.json
           if git diff --staged --quiet; then
-            echo "Watchlist unchanged — nothing to commit"
+            echo "No data changes — nothing to commit"
           else
-            git commit -m "Update watchlist [skip ci]"
+            git commit -m "Update bot data [skip ci]"
             git push
           fi

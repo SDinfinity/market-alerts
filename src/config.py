@@ -30,7 +30,7 @@ MARKET_CLOSE_TIME: time = time(15, 30)
 # GitHub Actions cron fires at 9:12 AM IST; the script sleeps until 9:17 AM.
 # Closing alert is at 3:45 PM IST — 15 minutes after market closes at 3:30 PM.
 OPENING_ALERT_TIME: time = time(9, 17)
-CLOSING_ALERT_TIME: time = time(15, 45)
+CLOSING_ALERT_TIME: time = time(16, 0)
 
 # --- NSE Indices to always include in every alert ---
 # Each entry is (display_name, nse_api_symbol, yfinance_ticker_fallback)
@@ -78,6 +78,7 @@ TELEGRAM_RETRY_DELAY_SECONDS: int = 10
 # Where the watchlist is stored (relative to the project root)
 # In GitHub Actions, this file is part of the repo and committed back
 WATCHLIST_FILE: str = "data/watchlist.json"
+LAST_ALERT_FILE: str = "data/last_alert.json"
 
 # --- yfinance suffix for NSE stocks ---
 # NSE-listed stocks on Yahoo Finance need ".NS" appended (e.g., "INFY.NS")

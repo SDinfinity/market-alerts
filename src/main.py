@@ -7,19 +7,54 @@
 #   python src/main.py --dry-run    # Dry run: fetches data, prints messages, no Telegram send
 #   python src/main.py --opening    # Force send the opening alert right now
 #   python src/main.py --closing    # Force send the closing alert right now
-#   python src/main.py --commands   # Only process pending Telegram commands
+#   python src/main.py --commands   # No-op (commands handled by Cloudflare Worker)
 
 import sys
+import json
+import os
 import time
 import argparse
 from datetime import datetime
 
-from config import IST, OPENING_ALERT_TIME, logger
+from config import IST, OPENING_ALERT_TIME, CLOSING_ALERT_TIME, LAST_ALERT_FILE, logger
 from market_data import fetch_all_quotes
 from formatter import format_opening_alert, format_closing_alert, format_failure_alert
-from telegram_bot import send_message, process_pending_commands
+from telegram_bot import send_message
 from scheduler import is_trading_day, get_alert_type
 from watchlist import load_watchlist
+
+
+def load_last_alert() -> dict:
+    """Loads the deduplication state from data/last_alert.json."""
+    try:
+        with open(LAST_ALERT_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_last_alert(data: dict) -> None:
+    """Writes the deduplication state to data/last_alert.json."""
+    os.makedirs(os.path.dirname(LAST_ALERT_FILE), exist_ok=True)
+    with open(LAST_ALERT_FILE, "w") as f:
+        json.dump(data, f)
+
+
+def already_sent_today(alert_type: str) -> bool:
+    """Returns True if the given alert type was already sent today (dedup check)."""
+    today = datetime.now(tz=IST).strftime("%Y-%m-%d")
+    last = load_last_alert()
+    return last.get("date") == today and last.get(alert_type, False)
+
+
+def mark_sent_today(alert_type: str) -> None:
+    """Records that the given alert type was sent today."""
+    today = datetime.now(tz=IST).strftime("%Y-%m-%d")
+    last = load_last_alert()
+    if last.get("date") != today:
+        last = {"date": today, "opening": False, "closing": False}
+    last[alert_type] = True
+    save_last_alert(last)
 
 
 def send_alert(alert_type: str, dry_run: bool = False) -> bool:
@@ -78,9 +113,7 @@ def send_alert(alert_type: str, dry_run: bool = False) -> bool:
 def sleep_until_opening() -> None:
     """
     Sleeps until exactly 9:17 AM IST before the opening alert is sent.
-    GitHub Actions cron fires at 9:12 AM IST to allow for startup time.
-    This function bridges the remaining gap so the alert goes out at 9:17 AM sharp.
-    If it is already past 9:17 AM when this runs, no sleep is needed.
+    If it is already past 9:17 AM, no sleep is needed — send immediately.
     """
     now = datetime.now(tz=IST)
     target = now.replace(
@@ -99,7 +132,33 @@ def sleep_until_opening() -> None:
     else:
         logger.info(
             f"Already past {OPENING_ALERT_TIME.strftime('%I:%M %p')} IST "
-            f"— no sleep needed"
+            f"— sending immediately"
+        )
+
+
+def sleep_until_closing() -> None:
+    """
+    Sleeps until exactly 4:00 PM IST before the closing alert is sent.
+    If it is already past 4:00 PM, no sleep is needed — send immediately.
+    """
+    now = datetime.now(tz=IST)
+    target = now.replace(
+        hour=CLOSING_ALERT_TIME.hour,
+        minute=CLOSING_ALERT_TIME.minute,
+        second=0,
+        microsecond=0,
+    )
+    wait_seconds = (target - now).total_seconds()
+    if wait_seconds > 0:
+        logger.info(
+            f"Sleeping {wait_seconds:.0f}s until "
+            f"{CLOSING_ALERT_TIME.strftime('%I:%M %p')} IST..."
+        )
+        time.sleep(wait_seconds)
+    else:
+        logger.info(
+            f"Already past {CLOSING_ALERT_TIME.strftime('%I:%M %p')} IST "
+            f"— sending immediately"
         )
 
 
@@ -107,16 +166,11 @@ def run_normal() -> None:
     """
     The normal scheduled run. Checks if today is a trading day and
     determines which alert to send based on the current IST time.
-    Also processes any pending Telegram commands from users.
-    For the opening alert, sleeps until exactly 9:17 AM IST before sending.
+    Deduplicates so only one alert per type is sent per day even when
+    multiple crons fire in the same window.
     """
     now = datetime.now(tz=IST)
     logger.info(f"Normal run starting at {now.strftime('%Y-%m-%d %H:%M:%S IST')}")
-
-    # First, always check for pending commands (so /add /remove work daily)
-    logger.info("Checking for pending Telegram commands...")
-    cmd_count = process_pending_commands()
-    logger.info(f"Processed {cmd_count} pending command(s)")
 
     # Check if today is a trading day
     if not is_trading_day():
@@ -129,12 +183,23 @@ def run_normal() -> None:
         logger.info("Current time doesn't match any alert window — nothing to send")
         return
 
-    # For the opening alert: sleep until exactly 9:17 AM IST so the alert
-    # arrives at a consistent time regardless of GitHub Actions startup delay.
+    # Deduplication: if we already sent this alert today, skip
+    if already_sent_today(alert_type):
+        logger.info(
+            f"{alert_type.capitalize()} alert already sent today — "
+            f"skipping duplicate run"
+        )
+        return
+
+    # Sleep until the exact target time if we're early
     if alert_type == "opening":
         sleep_until_opening()
+    elif alert_type == "closing":
+        sleep_until_closing()
 
-    send_alert(alert_type)
+    success = send_alert(alert_type)
+    if success:
+        mark_sent_today(alert_type)
 
 
 def run_test() -> None:
@@ -174,16 +239,6 @@ def run_dry_run() -> None:
     print("\n✅ Dry run complete. Messages printed above (not sent to Telegram).")
 
 
-def run_commands_only() -> None:
-    """
-    Command-only mode: only processes pending Telegram commands.
-    Useful if you want to handle commands without sending a market alert.
-    """
-    logger.info("COMMAND MODE: Processing pending Telegram commands only")
-    count = process_pending_commands()
-    logger.info(f"Done. Processed {count} command(s).")
-
-
 def main() -> None:
     """
     Parses command-line arguments and runs the appropriate mode.
@@ -214,7 +269,7 @@ def main() -> None:
     parser.add_argument(
         "--commands",
         action="store_true",
-        help="Only process pending Telegram commands, no alerts",
+        help="No-op: Telegram commands are now handled by the Cloudflare Worker",
     )
 
     args = parser.parse_args()
@@ -230,7 +285,7 @@ def main() -> None:
         logger.info("Forced closing alert mode")
         send_alert("closing")
     elif args.commands:
-        run_commands_only()
+        logger.info("--commands is a no-op: Telegram commands are handled by Cloudflare Worker")
     else:
         run_normal()
 
