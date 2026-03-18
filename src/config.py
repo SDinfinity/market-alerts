@@ -26,10 +26,10 @@ TELEGRAM_CHAT_ID: str = os.environ.get("TELEGRAM_CHAT_ID", "")
 MARKET_OPEN_TIME: time = time(9, 15)
 MARKET_CLOSE_TIME: time = time(15, 30)
 
-# Opening alert is at 9:30 AM IST — 15 minutes after the market opens at 9:15 AM.
-# This ensures opening prices are available when we fetch them.
+# Opening alert sends at exactly 9:17 AM IST.
+# GitHub Actions cron fires at 9:12 AM IST; the script sleeps until 9:17 AM.
 # Closing alert is at 3:45 PM IST — 15 minutes after market closes at 3:30 PM.
-OPENING_ALERT_TIME: time = time(9, 30)
+OPENING_ALERT_TIME: time = time(9, 17)
 CLOSING_ALERT_TIME: time = time(15, 45)
 
 # --- NSE Indices to always include in every alert ---

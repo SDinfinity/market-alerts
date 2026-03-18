@@ -10,10 +10,11 @@
 #   python src/main.py --commands   # Only process pending Telegram commands
 
 import sys
+import time
 import argparse
 from datetime import datetime
 
-from config import IST, logger
+from config import IST, OPENING_ALERT_TIME, logger
 from market_data import fetch_all_quotes
 from formatter import format_opening_alert, format_closing_alert, format_failure_alert
 from telegram_bot import send_message, process_pending_commands
@@ -74,11 +75,40 @@ def send_alert(alert_type: str, dry_run: bool = False) -> bool:
     return success
 
 
+def sleep_until_opening() -> None:
+    """
+    Sleeps until exactly 9:17 AM IST before the opening alert is sent.
+    GitHub Actions cron fires at 9:12 AM IST to allow for startup time.
+    This function bridges the remaining gap so the alert goes out at 9:17 AM sharp.
+    If it is already past 9:17 AM when this runs, no sleep is needed.
+    """
+    now = datetime.now(tz=IST)
+    target = now.replace(
+        hour=OPENING_ALERT_TIME.hour,
+        minute=OPENING_ALERT_TIME.minute,
+        second=0,
+        microsecond=0,
+    )
+    wait_seconds = (target - now).total_seconds()
+    if wait_seconds > 0:
+        logger.info(
+            f"Sleeping {wait_seconds:.0f}s until "
+            f"{OPENING_ALERT_TIME.strftime('%I:%M %p')} IST..."
+        )
+        time.sleep(wait_seconds)
+    else:
+        logger.info(
+            f"Already past {OPENING_ALERT_TIME.strftime('%I:%M %p')} IST "
+            f"— no sleep needed"
+        )
+
+
 def run_normal() -> None:
     """
     The normal scheduled run. Checks if today is a trading day and
     determines which alert to send based on the current IST time.
     Also processes any pending Telegram commands from users.
+    For the opening alert, sleeps until exactly 9:17 AM IST before sending.
     """
     now = datetime.now(tz=IST)
     logger.info(f"Normal run starting at {now.strftime('%Y-%m-%d %H:%M:%S IST')}")
@@ -98,6 +128,11 @@ def run_normal() -> None:
     if alert_type is None:
         logger.info("Current time doesn't match any alert window — nothing to send")
         return
+
+    # For the opening alert: sleep until exactly 9:17 AM IST so the alert
+    # arrives at a consistent time regardless of GitHub Actions startup delay.
+    if alert_type == "opening":
+        sleep_until_opening()
 
     send_alert(alert_type)
 

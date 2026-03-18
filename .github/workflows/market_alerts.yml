@@ -1,11 +1,13 @@
 # GitHub Actions workflow for the Market Alerts Bot.
 # This runs the bot on a schedule and handles all three scenarios:
-# 1. Opening alert at 9:30 AM IST (4:00 AM UTC) — 15 min after market opens
-# 2. Closing alert at 3:45 PM IST (10:15 AM UTC) — 15 min after market closes
+# 1. Opening alert targeting 9:17 AM IST delivery:
+#    Cron fires at 9:12 AM IST (3:42 AM UTC) to allow for GitHub startup delay.
+#    The script then sleeps until exactly 9:17 AM IST before fetching and sending.
+# 2. Closing alert at 3:45 PM IST (10:15 AM UTC)
 # 3. Command processing every 15 minutes during market hours
 #
 # GitHub Actions runs in UTC — IST is UTC+5:30, so:
-# 9:30 AM IST = 4:00 AM UTC
+# 9:12 AM IST = 3:42 AM UTC
 # 3:45 PM IST = 10:15 AM UTC
 
 name: Market Alerts
@@ -13,9 +15,9 @@ name: Market Alerts
 on:
   # Scheduled runs (all times are UTC, GitHub Actions uses UTC)
   schedule:
-    # Opening alert: 9:30 AM IST = 4:00 AM UTC (Mon-Fri)
-    # Runs 15 minutes after market opens so opening prices are available
-    - cron: "0 4 * * 1-5"
+    # Opening alert: fires at 9:12 AM IST = 3:42 AM UTC (Mon-Fri)
+    # Script sleeps inside until 9:17 AM IST before fetching data
+    - cron: "42 3 * * 1-5"
     # Closing alert: 3:45 PM IST = 10:15 AM UTC (Mon-Fri)
     - cron: "15 10 * * 1-5"
     # Command processing: every 15 minutes during market hours (4 AM - 12 PM UTC = 9:30 AM - 5:30 PM IST)
