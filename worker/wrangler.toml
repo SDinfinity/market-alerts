@@ -10,7 +10,7 @@ compatibility_date = "2024-01-01"
 # These are safe to store in this file (not sensitive).
 # Replace the values below with your actual GitHub username and repo name.
 [vars]
-GITHUB_OWNER = "your-github-username"
+GITHUB_OWNER = "SDinfinity"
 GITHUB_REPO  = "market-alerts"
 
 # ── Cron Triggers ────────────────────────────────────────────────────────────
