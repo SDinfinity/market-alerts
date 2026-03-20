@@ -476,6 +476,32 @@ function handleHelp() {
 // ─────────────────────────────────────────────────────────────
 
 export default {
+  async scheduled(event, env) {
+    // Determine opening vs closing by UTC hour.
+    // 3:12 AM UTC cron → opening; 9:55 AM UTC cron → closing.
+    const utcHour = new Date(event.scheduledTime).getUTCHours();
+    const mode = utcHour < 9 ? "opening" : "closing";
+
+    const url = `https://api.github.com/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/actions/workflows/market_alerts.yml/dispatches`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${env.GITHUB_TOKEN}`,
+        Accept: "application/vnd.github+json",
+        "User-Agent": "market-alerts-bot",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ ref: "main", inputs: { mode } }),
+    });
+
+    if (!res.ok) {
+      const err = await res.text();
+      console.error(`Failed to dispatch ${mode} workflow: ${res.status} ${err}`);
+    } else {
+      console.log(`Dispatched ${mode} workflow via GitHub Actions`);
+    }
+  },
+
   async fetch(request, env) {
     // Only accept POST requests (Telegram webhook sends POST)
     if (request.method !== "POST") {

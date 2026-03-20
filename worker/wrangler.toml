@@ -13,6 +13,13 @@ compatibility_date = "2024-01-01"
 GITHUB_OWNER = "your-github-username"
 GITHUB_REPO  = "market-alerts"
 
+# ── Cron Triggers ────────────────────────────────────────────────────────────
+# 3:12 AM UTC  = 8:42 AM IST  → triggers opening alert (script sleeps until 9:17 AM IST)
+# 9:55 AM UTC  = 3:25 PM IST  → triggers closing alert (script sleeps until 4:00 PM IST)
+# GitHub Actions crons are kept as backup; deduplication prevents double-sends.
+[triggers]
+crons = ["12 3 * * 1-5", "55 9 * * 1-5"]
+
 # ── Secrets (set via CLI, NOT stored here) ───────────────────────────────────
 # Run these three commands once after deploying:
 #

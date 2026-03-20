@@ -4,7 +4,7 @@
 
 import os
 import logging
-from datetime import time
+from datetime import time, date
 from typing import Optional
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
@@ -79,6 +79,35 @@ TELEGRAM_RETRY_DELAY_SECONDS: int = 10
 # In GitHub Actions, this file is part of the repo and committed back
 WATCHLIST_FILE: str = "data/watchlist.json"
 LAST_ALERT_FILE: str = "data/last_alert.json"
+
+# --- NSE Trading Holidays 2026 ---
+# Source: NSE circular NSE/CMTR/71775 (official trading holidays only).
+# DO NOT use the NSE API — it returns clearing/settlement holidays too,
+# which are NOT trading holidays (e.g. Gudi Padwa on Mar 19, 2026).
+NSE_HOLIDAYS_2026: set[date] = {
+    date(2026, 1, 26),   # Republic Day
+    date(2026, 3, 3),    # Holi
+    date(2026, 3, 26),   # Shri Ram Navami
+    date(2026, 3, 31),   # Shri Mahavir Jayanti
+    date(2026, 4, 3),    # Good Friday
+    date(2026, 4, 14),   # Dr. Ambedkar Jayanti
+    date(2026, 5, 1),    # Maharashtra Day
+    date(2026, 5, 28),   # Bakri Id
+    date(2026, 6, 26),   # Muharram
+    date(2026, 8, 19),   # Ganesh Chaturthi
+    date(2026, 10, 1),   # Mahatma Gandhi Jayanti / Dussehra
+    date(2026, 10, 2),   # Dussehra
+    date(2026, 10, 22),  # Diwali Laxmi Pujan
+    date(2026, 10, 23),  # Diwali Balipratipada
+    date(2026, 11, 5),   # Prakash Gurpurb Sri Guru Nanak Dev
+    date(2026, 12, 25),  # Christmas
+}
+
+# Special trading sessions on otherwise non-trading days (e.g. Muhurat Trading).
+# These dates should NOT be skipped even if they fall on weekends.
+NSE_SPECIAL_TRADING_DAYS_2026: set[date] = {
+    date(2026, 11, 8),   # Muhurat Trading (Sunday)
+}
 
 # --- yfinance suffix for NSE stocks ---
 # NSE-listed stocks on Yahoo Finance need ".NS" appended (e.g., "INFY.NS")

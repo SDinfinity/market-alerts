@@ -239,6 +239,41 @@ def run_dry_run() -> None:
     print("\n✅ Dry run complete. Messages printed above (not sent to Telegram).")
 
 
+def run_forced(alert_type: str) -> None:
+    """
+    Forced alert mode (--opening or --closing). Triggered by Cloudflare Worker crons.
+    - Still checks if today is a trading day; skips if not.
+    - Still deduplicates; skips if already sent today.
+    - Sleeps until the target time if invoked early.
+    - Does NOT check the time window (bypasses get_alert_type()).
+    """
+    now = datetime.now(tz=IST)
+    logger.info(
+        f"Forced {alert_type} mode starting at "
+        f"{now.strftime('%Y-%m-%d %H:%M:%S IST')}"
+    )
+
+    if not is_trading_day():
+        logger.info("Today is not a trading day — skipping forced alert")
+        return
+
+    if already_sent_today(alert_type):
+        logger.info(
+            f"{alert_type.capitalize()} alert already sent today — "
+            f"skipping duplicate"
+        )
+        return
+
+    if alert_type == "opening":
+        sleep_until_opening()
+    elif alert_type == "closing":
+        sleep_until_closing()
+
+    success = send_alert(alert_type)
+    if success:
+        mark_sent_today(alert_type)
+
+
 def main() -> None:
     """
     Parses command-line arguments and runs the appropriate mode.
@@ -279,11 +314,9 @@ def main() -> None:
     elif args.dry_run:
         run_dry_run()
     elif args.opening:
-        logger.info("Forced opening alert mode")
-        send_alert("opening")
+        run_forced("opening")
     elif args.closing:
-        logger.info("Forced closing alert mode")
-        send_alert("closing")
+        run_forced("closing")
     elif args.commands:
         logger.info("--commands is a no-op: Telegram commands are handled by Cloudflare Worker")
     else:
