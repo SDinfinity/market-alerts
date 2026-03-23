@@ -1,26 +1,35 @@
 /**
- * Cloudflare Worker — Telegram webhook handler for Market Alerts Bot.
+ * Cloudflare Worker — Market Alerts Bot
  *
- * Handles commands instantly via webhook (no polling delay):
- *   /add TICKER [, TICKER2, ...]   — add one or more stocks
- *   /remove [TICKER | NUMBER]      — remove by ticker or list position
- *   /list                          — show current watchlist
- *   /status                        — show bot status
- *   /help                          — show command reference
+ * Two responsibilities:
  *
- * Environment variables (set via `wrangler secret put`):
+ * 1. SCHEDULED ALERTS (cron triggers — primary alerting path):
+ *    Fires at exact market times, fetches live data, formats and sends
+ *    Telegram alerts directly — no GitHub Actions in the critical path.
+ *      3:47 AM UTC  = 9:17 AM IST  → opening alert
+ *      10:30 AM UTC = 4:00 PM IST  → closing alert
+ *    Dedup state is stored in data/last_alert.json on GitHub.
+ *
+ * 2. TELEGRAM WEBHOOK (HTTP POST — command handling):
+ *    Handles bot commands instantly:
+ *      /add TICKER [, TICKER2, ...]   — add one or more stocks
+ *      /remove [TICKER | NUMBER]      — remove by ticker or list position
+ *      /list                          — show current watchlist
+ *      /status                        — show bot status
+ *      /help                          — show command reference
+ *
+ * Secrets (set via `wrangler secret put`):
  *   TELEGRAM_BOT_TOKEN  — from @BotFather
  *   TELEGRAM_CHAT_ID    — your personal chat ID (security filter)
  *   GITHUB_TOKEN        — Personal Access Token with repo write access
  *
  * Variables in wrangler.toml (not secrets):
- *   GITHUB_OWNER        — your GitHub username
- *   GITHUB_REPO         — repository name (e.g. "market-alerts")
+ *   GITHUB_OWNER, GITHUB_REPO
  */
 
-// ─────────────────────────────────────────────────────────────
-// NSE company name → ticker map (mirrors watchlist.py)
-// ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// NSE company name → ticker map (used by /add command fuzzy search)
+// ─────────────────────────────────────────────────────────────────────────────
 
 const NSE_COMPANY_MAP = {
   // Nifty 50
@@ -118,11 +127,9 @@ const NSE_COMPANY_MAP = {
   "MCX": "MCX",
   "CAMS": "CAMS", "COMPUTER AGE MANAGEMENT": "CAMS",
   "ASTRAL": "ASTRAL",
-  "INDIGO": "INDIGO",
   "MARICO": "MARICO",
   "GODREJ CONSUMER": "GODREJCP", "GODREJCP": "GODREJCP",
   "DABUR": "DABUR",
-  "PIGEON": "TTKHLTCARE",
   "PIDILITE": "PIDILITIND", "PIDILITIND": "PIDILITIND",
   "MUTHOOT FINANCE": "MUTHOOTFIN", "MUTHOOTFIN": "MUTHOOTFIN",
   "SHRIRAM FINANCE": "SHRIRAMFIN", "SHRIRAMFIN": "SHRIRAMFIN",
@@ -148,26 +155,18 @@ const NSE_COMPANY_MAP = {
   "BATA INDIA": "BATAIND", "BATAIND": "BATAIND",
   "MOTHERSON SUMI": "MOTHERSON", "MOTHERSON": "MOTHERSON",
   "BOSCH": "BOSCHLTD", "BOSCHLTD": "BOSCHLTD",
+  "EDELWEISS": "EDELWEISS",
 };
 
-// ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 // Fuzzy search (no npm — pure string scoring)
-// ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * Scores how well `query` matches `candidate` (0–100).
- * Uses a combination of:
- *   - Exact match (100)
- *   - Prefix match (90)
- *   - Contains match (80 minus length penalty)
- *   - Bigram similarity (0–70)
- */
 function fuzzyScore(query, candidate) {
   if (query === candidate) return 100;
   if (candidate.startsWith(query)) return 90;
   if (candidate.includes(query)) return Math.max(50, 80 - (candidate.length - query.length));
 
-  // Bigram similarity
   const bigrams = (s) => {
     const b = new Set();
     for (let i = 0; i < s.length - 1; i++) b.add(s.slice(i, i + 2));
@@ -181,10 +180,6 @@ function fuzzyScore(query, candidate) {
   return Math.round((2 * intersection / (qBig.size + cBig.size)) * 70);
 }
 
-/**
- * Returns top matches for `query` from NSE_COMPANY_MAP.
- * Each result: { ticker, label, score }
- */
 function fuzzySearch(query, limit = 5) {
   const q = query.toUpperCase().trim();
   const seen = new Set();
@@ -203,40 +198,435 @@ function fuzzySearch(query, limit = 5) {
   return results.slice(0, limit);
 }
 
-// ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Trading day logic
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Official NSE trading holidays 2026 (from NSE circular NSE/CMTR/71775).
+const NSE_HOLIDAYS_2026 = new Set([
+  "2026-01-26", // Republic Day
+  "2026-03-03", // Holi
+  "2026-03-26", // Shri Ram Navami
+  "2026-03-31", // Shri Mahavir Jayanti
+  "2026-04-03", // Good Friday
+  "2026-04-14", // Dr. Ambedkar Jayanti
+  "2026-05-01", // Maharashtra Day
+  "2026-05-28", // Bakri Id
+  "2026-06-26", // Muharram
+  "2026-08-19", // Ganesh Chaturthi
+  "2026-10-01", // Mahatma Gandhi Jayanti / Dussehra
+  "2026-10-02", // Dussehra
+  "2026-10-22", // Diwali Laxmi Pujan
+  "2026-10-23", // Diwali Balipratipada
+  "2026-11-05", // Prakash Gurpurb Sri Guru Nanak Dev
+  "2026-12-25", // Christmas
+]);
+
+// Special sessions on otherwise non-trading days (e.g. Muhurat Trading).
+const NSE_SPECIAL_TRADING_DAYS_2026 = new Set([
+  "2026-11-08", // Muhurat Trading (Sunday)
+]);
+
+/** Returns today's date string in IST (e.g. "2026-03-23"). */
+function getISTDateString() {
+  const ist = new Date(Date.now() + (5 * 60 + 30) * 60 * 1000);
+  return ist.toISOString().slice(0, 10);
+}
+
+/** Returns true if today (IST) is an NSE trading day. */
+function isTradingDay() {
+  const dateStr = getISTDateString();
+  if (NSE_SPECIAL_TRADING_DAYS_2026.has(dateStr)) return true;
+
+  const ist = new Date(Date.now() + (5 * 60 + 30) * 60 * 1000);
+  const dow = ist.getUTCDay(); // 0 = Sunday, 6 = Saturday
+  if (dow === 0 || dow === 6) return false;
+  if (NSE_HOLIDAYS_2026.has(dateStr)) return false;
+  return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Market data — index config + fetching
+// ─────────────────────────────────────────────────────────────────────────────
+
+const INDICES_CONFIG = [
+  { display: "NIFTY 50",      nse: "NIFTY 50",          yf: "^NSEI"    },
+  { display: "NIFTY NEXT 50", nse: "NIFTY NEXT 50",     yf: "^NSMIDCP" },
+  { display: "MIDCAP 150",    nse: "NIFTY MIDCAP 150",  yf: null       },
+  { display: "SMALLCAP 250",  nse: "NIFTY SMLCAP 250",  yf: null       },
+  { display: "NIFTY 500",     nse: "NIFTY 500",         yf: "^CRSLDX"  },
+];
+
+const NSE_INDEX_DISPLAY = Object.fromEntries(
+  INDICES_CONFIG.map(({ display, nse }) => [nse, display])
+);
+
+const NSE_HEADERS = {
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  "Accept": "application/json, text/plain, */*",
+  "Accept-Language": "en-US,en;q=0.9",
+  "Referer": "https://www.nseindia.com/",
+};
+
+const YAHOO_HEADERS = {
+  "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  "Accept": "application/json",
+};
+
+/**
+ * Fetches all 5 index values from NSE India's allIndices API in one call.
+ * Returns a map of nse_symbol → quote object, or {} on failure.
+ */
+async function fetchIndicesFromNSE() {
+  try {
+    const res = await fetch("https://www.nseindia.com/api/allIndices", {
+      headers: NSE_HEADERS,
+    });
+    if (!res.ok) return {};
+
+    const data = await res.json();
+    const rows = data?.data;
+    if (!Array.isArray(rows) || rows.length === 0) return {};
+
+    const lookup = Object.fromEntries(rows.map((r) => [r.indexSymbol, r]));
+    const results = {};
+
+    for (const { display, nse } of INDICES_CONFIG) {
+      const r = lookup[nse];
+      if (!r) continue;
+      const currentPrice = parseFloat(r.last) || 0;
+      if (currentPrice === 0) continue;
+      const prevClose = parseFloat(r.previousClose) || 0;
+      results[nse] = {
+        ticker: nse,
+        displayName: display,
+        currentPrice,
+        prevClose,
+        openPrice: parseFloat(r.open) || 0,
+        dayHigh: parseFloat(r.high) || 0,
+        dayLow: parseFloat(r.low) || 0,
+        change: currentPrice - prevClose,
+        changePct: parseFloat(r.percentChange) || 0,
+        isIndex: true,
+      };
+    }
+    return results;
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Fetches a single quote from Yahoo Finance chart API.
+ * Used as fallback for both indices (with ^NSEI etc.) and stocks (with .NS suffix).
+ * Returns a quote object, or null on failure.
+ */
+async function fetchViaYahoo(symbol, displayName, isIndex) {
+  try {
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=1d`;
+    const res = await fetch(url, { headers: YAHOO_HEADERS });
+    if (!res.ok) return null;
+
+    const data = await res.json();
+    const result = data?.chart?.result?.[0];
+    if (!result) return null;
+
+    const meta = result.meta;
+    const currentPrice = meta?.regularMarketPrice;
+    const prevClose = meta?.chartPreviousClose ?? meta?.previousClose;
+    if (!currentPrice || !prevClose) return null;
+
+    const cp = parseFloat(currentPrice);
+    const pc = parseFloat(prevClose);
+    const change = cp - pc;
+    const changePct = pc !== 0 ? (change / pc) * 100 : 0;
+
+    return {
+      ticker: symbol,
+      displayName,
+      currentPrice: cp,
+      prevClose: pc,
+      openPrice: parseFloat(meta?.regularMarketOpen) || 0,
+      dayHigh: parseFloat(meta?.regularMarketDayHigh) || 0,
+      dayLow: parseFloat(meta?.regularMarketDayLow) || 0,
+      change,
+      changePct,
+      isIndex,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Fetches a single NSE stock from NSE's equity API.
+ * Returns a quote object, or null on failure (caller falls back to Yahoo).
+ */
+async function fetchStockFromNSE(ticker) {
+  try {
+    const url = `https://www.nseindia.com/api/quote-equity?symbol=${encodeURIComponent(ticker)}`;
+    const res = await fetch(url, { headers: NSE_HEADERS });
+    if (!res.ok) return null;
+
+    const data = await res.json();
+    const pi = data?.priceInfo;
+    if (!pi) return null;
+
+    const currentPrice = parseFloat(pi.lastPrice ?? pi.close) || 0;
+    if (currentPrice === 0) return null;
+
+    const prevClose = parseFloat(pi.previousClose ?? pi.basePrice) || 0;
+    const intraday = pi.intraDayHighLow || {};
+    const change = currentPrice - prevClose;
+    const changePct = parseFloat(pi.pChange) || 0;
+
+    return {
+      ticker,
+      displayName: ticker,
+      currentPrice,
+      prevClose,
+      openPrice: parseFloat(pi.open) || 0,
+      dayHigh: parseFloat(intraday.max) || 0,
+      dayLow: parseFloat(intraday.min) || 0,
+      change,
+      changePct,
+      isIndex: false,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Fetches a single stock quote: NSE equity API first, Yahoo Finance fallback.
+ */
+async function fetchStockQuote(ticker) {
+  const nseQuote = await fetchStockFromNSE(ticker);
+  if (nseQuote) return nseQuote;
+  return fetchViaYahoo(`${ticker}.NS`, ticker, false);
+}
+
+/**
+ * Fetches all quotes: 5 indices + every stock in the watchlist.
+ * Returns { quotes: [...], failed: [...] }.
+ * Indices and stocks are fetched in parallel for speed.
+ */
+async function fetchAllQuotes(watchlist) {
+  // Fetch indices (one NSE call, with per-index Yahoo fallback)
+  const nseIndices = await fetchIndicesFromNSE();
+
+  const indexPromises = INDICES_CONFIG.map(async ({ display, nse, yf }) => {
+    if (nseIndices[nse]) return { quote: nseIndices[nse], ticker: nse };
+    if (yf) {
+      const q = await fetchViaYahoo(yf, display, true);
+      return { quote: q, ticker: nse };
+    }
+    return { quote: null, ticker: nse };
+  });
+
+  // Fetch watchlist stocks in parallel
+  const stockPromises = watchlist.map(async (ticker) => {
+    const q = await fetchStockQuote(ticker);
+    return { quote: q, ticker };
+  });
+
+  const [indexResults, stockResults] = await Promise.all([
+    Promise.all(indexPromises),
+    Promise.all(stockPromises),
+  ]);
+
+  const quotes = [];
+  const failed = [];
+
+  for (const { quote, ticker } of indexResults) {
+    if (quote) quotes.push(quote);
+    else failed.push(ticker);
+  }
+  for (const { quote, ticker } of stockResults) {
+    if (quote) quotes.push(quote);
+    else failed.push(ticker);
+  }
+
+  return { quotes, failed };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Message formatting
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Column layout matching the Python formatter (31 chars wide per row):
+//   Stocks:  name.padEnd(15) + price.padStart(8) + "   " + pct.padStart(5)
+//   Indices: name.padEnd(15) + price.padStart(9) + "  "  + pct.padStart(5)
+const DIVIDER = "━".repeat(31);
+
+const NSE_INDEX_SYMBOLS = new Set(INDICES_CONFIG.map((i) => i.nse));
+
+/** Formats a price with commas and 2 decimals: 1234.5 → "1,234.50" */
+function fmtPrice(v) {
+  const parts = v.toFixed(2).split(".");
+  parts[0] = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  return parts.join(".");
+}
+
+/** Formats a percentage with sign and 1 decimal: 2.137 → "+2.1%" */
+function fmtPct(v) {
+  return (v >= 0 ? "+" : "") + v.toFixed(1) + "%";
+}
+
+function stockRow(name, price, pct) {
+  return name.padEnd(15) + fmtPrice(price).padStart(8) + "   " + fmtPct(pct).padStart(5);
+}
+
+function indexRow(name, price, pct) {
+  return name.padEnd(15) + fmtPrice(price).padStart(9) + "  " + fmtPct(pct).padStart(5);
+}
+
+/** Returns a human-readable IST date string, e.g. "Mon, 23 Mar 2026". */
+function getISTDateStr() {
+  const ist = new Date(Date.now() + (5 * 60 + 30) * 60 * 1000);
+  const days   = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const d = String(ist.getUTCDate()).padStart(2, "0");
+  return `${days[ist.getUTCDay()]}, ${d} ${months[ist.getUTCMonth()]} ${ist.getUTCFullYear()}`;
+}
+
+/**
+ * Opening alert: stocks sorted by gap% (open vs prev close) high → low.
+ * Indices follow in fixed order.
+ */
+function formatOpeningAlert(quotes, failed) {
+  const dateStr = getISTDateStr();
+  const indices = quotes.filter((q) => q.isIndex);
+  const stocks  = quotes.filter((q) => !q.isIndex);
+
+  stocks.sort((a, b) => {
+    const gapA = a.openPrice > 0 ? (a.openPrice - a.prevClose) / a.prevClose * 100 : a.changePct;
+    const gapB = b.openPrice > 0 ? (b.openPrice - b.prevClose) / b.prevClose * 100 : b.changePct;
+    return gapB - gapA;
+  });
+
+  const header = "Ticker".padEnd(15) + "Open".padStart(8) + "   " + "Gap".padStart(5);
+  const lines = ["<pre>"];
+  lines.push(`Market open \u2014 ${dateStr}`);
+  lines.push("Sorted by gap high \u2192 low");
+  lines.push("");
+  lines.push(header);
+  lines.push(DIVIDER);
+
+  for (const q of stocks) {
+    const price = q.openPrice > 0 ? q.openPrice : q.prevClose;
+    const gap   = q.openPrice > 0
+      ? (q.openPrice - q.prevClose) / q.prevClose * 100
+      : q.changePct;
+    lines.push(stockRow(q.displayName, price, gap));
+  }
+
+  lines.push("");
+  lines.push("Indices");
+  for (const q of indices) {
+    lines.push(indexRow(q.displayName, q.currentPrice, q.changePct));
+  }
+
+  lines.push("");
+  lines.push("Gap = open vs prev close");
+
+  const stockFailed = failed.filter((t) => !NSE_INDEX_SYMBOLS.has(t));
+  if (stockFailed.length > 0) {
+    lines.push(`Could not fetch: ${stockFailed.join(", ")}`);
+  }
+
+  lines.push("</pre>");
+  return lines.join("\n");
+}
+
+/**
+ * Closing alert: stocks sorted by change% (best performers first).
+ * Indices follow in fixed order.
+ */
+function formatClosingAlert(quotes, failed) {
+  const dateStr = getISTDateStr();
+  const indices = quotes.filter((q) => q.isIndex);
+  const stocks  = quotes.filter((q) => !q.isIndex);
+
+  stocks.sort((a, b) => b.changePct - a.changePct);
+
+  const header = "Ticker".padEnd(15) + "Close".padStart(8) + "   " + "Chg".padStart(5);
+  const lines = ["<pre>"];
+  lines.push(`Market close \u2014 ${dateStr}`);
+  lines.push("Sorted best \u2192 worst");
+  lines.push("");
+  lines.push(header);
+  lines.push(DIVIDER);
+
+  for (const q of stocks) {
+    lines.push(stockRow(q.displayName, q.currentPrice, q.changePct));
+  }
+
+  lines.push("");
+  lines.push("Indices");
+  for (const q of indices) {
+    lines.push(indexRow(q.displayName, q.currentPrice, q.changePct));
+  }
+
+  lines.push("");
+  lines.push("Chg = close vs prev close");
+
+  const stockFailed = failed.filter((t) => !NSE_INDEX_SYMBOLS.has(t));
+  if (stockFailed.length > 0) {
+    lines.push(`Could not fetch: ${stockFailed.join(", ")}`);
+  }
+
+  lines.push("</pre>");
+  return lines.join("\n");
+}
+
+/** Sent when ALL data fetches fail. */
+function formatFailureAlert() {
+  const ist = new Date(Date.now() + (5 * 60 + 30) * 60 * 1000);
+  const timeStr = ist.toISOString().replace("T", " ").slice(0, 16) + " IST";
+  return (
+    `<pre>Market alert failed\n\n` +
+    `Could not fetch any market data at ${timeStr}.\n\n` +
+    `Possible cause: Yahoo Finance or NSE API temporarily unavailable.\n` +
+    `Please check the market manually.</pre>`
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // GitHub API helpers
-// ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 
-const WATCHLIST_PATH = "data/watchlist.json";
+const WATCHLIST_PATH   = "data/watchlist.json";
+const LAST_ALERT_PATH  = "data/last_alert.json";
 
+function githubHeaders(env) {
+  return {
+    Authorization: `Bearer ${env.GITHUB_TOKEN}`,
+    Accept: "application/vnd.github+json",
+    "User-Agent": "market-alerts-bot",
+  };
+}
+
+/** Reads data/watchlist.json from GitHub. Returns { watchlist, sha }. */
 async function githubGet(env) {
   const url = `https://api.github.com/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/contents/${WATCHLIST_PATH}`;
-  const res = await fetch(url, {
-    headers: {
-      Authorization: `Bearer ${env.GITHUB_TOKEN}`,
-      Accept: "application/vnd.github+json",
-      "User-Agent": "market-alerts-bot",
-    },
-  });
+  const res = await fetch(url, { headers: githubHeaders(env) });
   if (!res.ok) throw new Error(`GitHub GET failed: ${res.status}`);
   const data = await res.json();
   const content = JSON.parse(atob(data.content.replace(/\n/g, "")));
   return { watchlist: content.watchlist || [], sha: data.sha };
 }
 
+/** Writes data/watchlist.json to GitHub. */
 async function githubPut(env, watchlist, sha) {
   const url = `https://api.github.com/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/contents/${WATCHLIST_PATH}`;
   const content = btoa(JSON.stringify({ watchlist }, null, 2) + "\n");
   const res = await fetch(url, {
     method: "PUT",
-    headers: {
-      Authorization: `Bearer ${env.GITHUB_TOKEN}`,
-      Accept: "application/vnd.github+json",
-      "User-Agent": "market-alerts-bot",
-      "Content-Type": "application/json",
-    },
+    headers: { ...githubHeaders(env), "Content-Type": "application/json" },
     body: JSON.stringify({
-      message: `Update watchlist via Telegram [skip ci]`,
+      message: "Update watchlist via Telegram [skip ci]",
       content,
       sha,
     }),
@@ -247,62 +637,82 @@ async function githubPut(env, watchlist, sha) {
   }
 }
 
-// ─────────────────────────────────────────────────────────────
-// NSE ticker validation
-// ─────────────────────────────────────────────────────────────
+/**
+ * Reads data/last_alert.json from GitHub for dedup checking.
+ * Returns { state, sha } — state is {} if the file doesn't exist yet.
+ */
+async function githubGetLastAlert(env) {
+  const url = `https://api.github.com/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/contents/${LAST_ALERT_PATH}`;
+  const res = await fetch(url, { headers: githubHeaders(env) });
+  if (!res.ok) return { state: {}, sha: null };
+  const data = await res.json();
+  const state = JSON.parse(atob(data.content.replace(/\n/g, "")));
+  return { state, sha: data.sha };
+}
 
 /**
- * Checks if a ticker is valid on NSE by hitting Yahoo Finance chart API.
- * Returns true if Yahoo Finance returns price data for TICKER.NS.
+ * Writes data/last_alert.json to GitHub to record that an alert was sent.
+ * Uses [skip ci] so this commit doesn't re-trigger GitHub Actions.
  */
+async function githubPutLastAlert(env, state, sha) {
+  const url = `https://api.github.com/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/contents/${LAST_ALERT_PATH}`;
+  const body = {
+    message: "Update bot data [skip ci]",
+    content: btoa(JSON.stringify(state, null, 2) + "\n"),
+  };
+  if (sha) body.sha = sha;
+
+  const res = await fetch(url, {
+    method: "PUT",
+    headers: { ...githubHeaders(env), "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const err = await res.text();
+    console.error(`Failed to update last_alert.json: ${res.status} ${err}`);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NSE ticker validation (used by /add command)
+// ─────────────────────────────────────────────────────────────────────────────
+
 async function isValidNseTicker(ticker) {
-  // Check static map first (instant)
   if (NSE_COMPANY_MAP[ticker.toUpperCase()]) return true;
 
-  // Verify against Yahoo Finance
   try {
-    const yf = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}.NS?interval=1d&range=1d`;
-    const res = await fetch(yf, {
-      headers: {
-        "User-Agent": "Mozilla/5.0",
-        Accept: "application/json",
-      },
-    });
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}.NS?interval=1d&range=1d`;
+    const res = await fetch(url, { headers: YAHOO_HEADERS });
     if (!res.ok) return false;
     const data = await res.json();
     const result = data?.chart?.result?.[0];
-    return !!(result && result.meta && result.meta.regularMarketPrice > 0);
+    return !!(result?.meta?.regularMarketPrice > 0);
   } catch {
     return false;
   }
 }
 
-// ─────────────────────────────────────────────────────────────
-// Telegram API helpers
-// ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Telegram API helper
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function sendTelegram(token, chatId, text) {
   await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      chat_id: chatId,
-      text,
-      parse_mode: "HTML",
-    }),
+    body: JSON.stringify({ chat_id: chatId, text, parse_mode: "HTML" }),
   });
 }
 
-// ─────────────────────────────────────────────────────────────
-// Command handlers
-// ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Telegram command handlers
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function handleAdd(args, env) {
   if (!args) {
     return "Usage: /add TICKER\nExample: /add INFY\nExample: /add INFY, TCS, WIPRO\n\nYou can search by company name:\n/add Infosys";
   }
 
-  // Split by comma for bulk add
   const inputs = args.split(",").map((s) => s.trim()).filter(Boolean);
   const results = [];
 
@@ -318,21 +728,16 @@ async function handleAdd(args, env) {
 
   for (const input of inputs) {
     const upper = input.toUpperCase();
-
-    // Check static map first (handles company names too)
     const mapped = NSE_COMPANY_MAP[upper];
     const ticker = mapped || upper;
 
-    // Check if already in watchlist
     if (watchlist.includes(ticker)) {
       results.push(`${ticker} — already in watchlist`);
       continue;
     }
 
-    // Validate ticker
     const valid = await isValidNseTicker(ticker);
     if (!valid) {
-      // Try fuzzy search for suggestions
       const suggestions = fuzzySearch(input, 3);
       if (suggestions.length > 0) {
         const opts = suggestions.map((s) => s.ticker).join(", ");
@@ -356,8 +761,7 @@ async function handleAdd(args, env) {
     }
   }
 
-  const summary = results.join("\n");
-  return `<pre>${summary}\n\nTotal: ${watchlist.length} stocks</pre>`;
+  return `<pre>${results.join("\n")}\n\nTotal: ${watchlist.length} stocks</pre>`;
 }
 
 async function handleRemove(args, env) {
@@ -370,14 +774,12 @@ async function handleRemove(args, env) {
 
   let { watchlist, sha } = watchlistData;
 
-  // No args → show numbered list
   if (!args) {
     if (watchlist.length === 0) return "Your watchlist is empty.";
     const numbered = watchlist.map((t, i) => `${i + 1}. ${t}`).join("\n");
     return `<pre>Your watchlist:\n${numbered}\n\nUse /remove TICKER or /remove 1,3 to remove by number.</pre>`;
   }
 
-  // Parse args: could be "TICKER", "1", "1,3", or "1, 3"
   const parts = args.split(",").map((s) => s.trim()).filter(Boolean);
   const toRemove = new Set();
   const errors = [];
@@ -385,14 +787,12 @@ async function handleRemove(args, env) {
   for (const part of parts) {
     const n = parseInt(part, 10);
     if (!isNaN(n)) {
-      // Number-based removal (1-indexed)
       if (n < 1 || n > watchlist.length) {
         errors.push(`${n} — invalid position (list has ${watchlist.length} stocks)`);
       } else {
         toRemove.add(watchlist[n - 1]);
       }
     } else {
-      // Ticker-based removal
       const upper = part.toUpperCase();
       if (!watchlist.includes(upper)) {
         errors.push(`${upper} — not in watchlist`);
@@ -439,18 +839,19 @@ async function handleList(env) {
 }
 
 function handleStatus() {
-  const now = new Date();
-  // Convert to IST (UTC+5:30)
-  const ist = new Date(now.getTime() + 5.5 * 60 * 60 * 1000);
+  const ist = new Date(Date.now() + (5 * 60 + 30) * 60 * 1000);
   const timeStr = ist.toISOString().replace("T", " ").slice(0, 19) + " IST";
+  const trading = isTradingDay();
 
   return (
     `<pre>Market Alerts Bot — Status\n\n` +
-    `Status:    Running\n` +
+    `Status:     Running\n` +
     `Time (IST): ${timeStr}\n` +
-    `Data:      NSE India API + Yahoo Finance\n` +
-    `Alerts:    9:17 AM IST (opening)\n` +
-    `           3:45 PM IST (closing)</pre>`
+    `Today:      ${trading ? "Trading day" : "Non-trading day"}\n` +
+    `Data:       NSE India API + Yahoo Finance\n` +
+    `Alerts:     9:17 AM IST (opening)\n` +
+    `            4:00 PM IST (closing)\n` +
+    `Engine:     Cloudflare Worker (direct)</pre>`
   );
 }
 
@@ -467,43 +868,99 @@ function handleHelp() {
     `/status         Show bot status\n` +
     `/help           Show this help\n\n` +
     `Alerts run Mon-Fri on trading days.\n` +
-    `Opening: 9:17 AM IST  Closing: 3:45 PM IST</pre>`
+    `Opening: 9:17 AM IST  Closing: 4:00 PM IST</pre>`
   );
 }
 
-// ─────────────────────────────────────────────────────────────
-// Main handler
-// ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Main export
+// ─────────────────────────────────────────────────────────────────────────────
 
 export default {
+  /**
+   * Cron handler — the primary alerting path.
+   *
+   * Fires at exact alert times (set in wrangler.toml):
+   *   3:47 AM UTC  = 9:17 AM IST → opening alert
+   *   10:30 AM UTC = 4:00 PM IST → closing alert
+   *
+   * Steps:
+   *   1. Skip if today is not a trading day.
+   *   2. Read last_alert.json from GitHub — skip if already sent today.
+   *   3. Read watchlist from GitHub.
+   *   4. Fetch market data (NSE primary, Yahoo Finance fallback).
+   *   5. Format and send Telegram message.
+   *   6. Write last_alert.json back to GitHub to mark as sent.
+   */
   async scheduled(event, env) {
-    // Determine opening vs closing by UTC hour.
-    // 3:12 AM UTC cron → opening; 9:55 AM UTC cron → closing.
     const utcHour = new Date(event.scheduledTime).getUTCHours();
-    const mode = utcHour < 9 ? "opening" : "closing";
+    const alertType = utcHour < 9 ? "opening" : "closing";
 
-    const url = `https://api.github.com/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/actions/workflows/market_alerts.yml/dispatches`;
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${env.GITHUB_TOKEN}`,
-        Accept: "application/vnd.github+json",
-        "User-Agent": "market-alerts-bot",
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ ref: "main", inputs: { mode } }),
-    });
-
-    if (!res.ok) {
-      const err = await res.text();
-      console.error(`Failed to dispatch ${mode} workflow: ${res.status} ${err}`);
-    } else {
-      console.log(`Dispatched ${mode} workflow via GitHub Actions`);
+    // Step 1: trading day check
+    if (!isTradingDay()) {
+      console.log(`${alertType}: not a trading day — skipping`);
+      return;
     }
+
+    // Step 2: dedup check via GitHub last_alert.json
+    const today = getISTDateString();
+    let lastAlertState, lastAlertSha;
+    try {
+      const { state, sha } = await githubGetLastAlert(env);
+      lastAlertState = state;
+      lastAlertSha = sha;
+    } catch (e) {
+      console.error(`Failed to read last_alert.json: ${e.message}`);
+      lastAlertState = {};
+      lastAlertSha = null;
+    }
+
+    if (lastAlertState.date === today && lastAlertState[alertType]) {
+      console.log(`${alertType}: already sent today — skipping`);
+      return;
+    }
+
+    // Step 3: read watchlist
+    let watchlist = [];
+    try {
+      const { watchlist: wl } = await githubGet(env);
+      watchlist = wl;
+    } catch (e) {
+      console.error(`Failed to read watchlist: ${e.message} — continuing with indices only`);
+    }
+
+    // Step 4: fetch market data
+    console.log(`Fetching market data for ${alertType} alert (${watchlist.length} stocks)...`);
+    const { quotes, failed } = await fetchAllQuotes(watchlist);
+    console.log(`Fetched ${quotes.length} quotes, ${failed.length} failed: ${failed.join(", ") || "none"}`);
+
+    // Step 5: format and send
+    let message;
+    if (quotes.length === 0) {
+      console.error("All data fetches failed — sending failure alert");
+      message = formatFailureAlert();
+    } else if (alertType === "opening") {
+      message = formatOpeningAlert(quotes, failed);
+    } else {
+      message = formatClosingAlert(quotes, failed);
+    }
+
+    await sendTelegram(env.TELEGRAM_BOT_TOKEN, env.TELEGRAM_CHAT_ID, message);
+    console.log(`${alertType} alert sent`);
+
+    // Step 6: mark as sent in last_alert.json
+    const newState = lastAlertState.date === today
+      ? { ...lastAlertState, [alertType]: true }
+      : { date: today, opening: false, closing: false, [alertType]: true };
+
+    await githubPutLastAlert(env, newState, lastAlertSha);
   },
 
+  /**
+   * HTTP handler — Telegram webhook for bot commands.
+   * Unchanged from the original implementation.
+   */
   async fetch(request, env) {
-    // Only accept POST requests (Telegram webhook sends POST)
     if (request.method !== "POST") {
       return new Response("OK", { status: 200 });
     }
@@ -526,37 +983,22 @@ export default {
       return new Response("OK", { status: 200 });
     }
 
-    // Parse command and args
     const text = message.text.trim();
     const spaceIdx = text.indexOf(" ");
     const rawCmd = spaceIdx === -1 ? text : text.slice(0, spaceIdx);
-    const args = spaceIdx === -1 ? "" : text.slice(spaceIdx + 1).trim();
-
-    // Strip bot username suffix (e.g. /add@MyBot → /add)
-    const cmd = rawCmd.split("@")[0].toLowerCase();
+    const args   = spaceIdx === -1 ? "" : text.slice(spaceIdx + 1).trim();
+    const cmd    = rawCmd.split("@")[0].toLowerCase();
 
     let reply;
     try {
       switch (cmd) {
-        case "/add":
-          reply = await handleAdd(args || null, env);
-          break;
-        case "/remove":
-          reply = await handleRemove(args || null, env);
-          break;
-        case "/list":
-          reply = await handleList(env);
-          break;
-        case "/status":
-          reply = handleStatus();
-          break;
+        case "/add":    reply = await handleAdd(args || null, env); break;
+        case "/remove": reply = await handleRemove(args || null, env); break;
+        case "/list":   reply = await handleList(env); break;
+        case "/status": reply = handleStatus(); break;
         case "/help":
-        case "/start":
-          reply = handleHelp();
-          break;
-        default:
-          // Ignore unknown commands silently
-          return new Response("OK", { status: 200 });
+        case "/start":  reply = handleHelp(); break;
+        default: return new Response("OK", { status: 200 });
       }
     } catch (e) {
       reply = `Error: ${e.message}`;

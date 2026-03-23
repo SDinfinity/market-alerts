@@ -14,11 +14,14 @@ GITHUB_OWNER = "SDinfinity"
 GITHUB_REPO  = "market-alerts"
 
 # ── Cron Triggers ────────────────────────────────────────────────────────────
-# 3:12 AM UTC  = 8:42 AM IST  → triggers opening alert (script sleeps until 9:17 AM IST)
-# 9:55 AM UTC  = 3:25 PM IST  → triggers closing alert (script sleeps until 4:00 PM IST)
-# GitHub Actions crons are kept as backup; deduplication prevents double-sends.
+# Worker fires at exact alert times and sends Telegram directly — no GitHub
+# Actions in the critical path. GitHub Actions crons remain as a backup;
+# deduplication via last_alert.json prevents double-sends.
+#
+# 3:47 AM UTC  = 9:17 AM IST  → opening alert
+# 10:30 AM UTC = 4:00 PM IST  → closing alert
 [triggers]
-crons = ["12 3 * * 1-5", "55 9 * * 1-5"]
+crons = ["47 3 * * 1-5", "30 10 * * 1-5"]
 
 # ── Secrets (set via CLI, NOT stored here) ───────────────────────────────────
 # Run these three commands once after deploying:

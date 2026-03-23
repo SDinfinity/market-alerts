@@ -54,13 +54,16 @@ def get_alert_type() -> Optional[str]:
 
     from datetime import time as time_
 
-    # Opening window: 8:45 AM – 9:45 AM IST
+    # Opening window: 8:45 AM – 11:30 AM IST
+    # Wide window absorbs GitHub Actions scheduler delays (routinely 30–90 min late).
+    # The script always sleeps until exactly 9:17 AM IST before sending, so the
+    # alert time is unaffected — only the detection window is widened.
     opening_start = time_(8, 45)
-    opening_end   = time_(9, 45)
+    opening_end   = time_(11, 30)
 
-    # Closing window: 3:15 PM – 4:16 PM IST
+    # Closing window: 3:15 PM – 6:00 PM IST (same rationale)
     closing_start = time_(15, 15)
-    closing_end   = time_(16, 16)
+    closing_end   = time_(18, 0)
 
     if opening_start <= current_time <= opening_end:
         return "opening"

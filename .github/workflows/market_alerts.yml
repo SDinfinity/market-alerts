@@ -1,30 +1,35 @@
 # GitHub Actions workflow for the Market Alerts Bot.
-# Runs frequent crons during two wide windows to survive GitHub scheduler delays.
 #
-# Opening window: every 3 min, 3:15–3:59 AM UTC + 4:00–4:03 AM UTC
-#   = 8:45–9:33 AM IST (market opens 9:15 AM IST, alert fires at 9:17 AM IST)
-#   Script sleeps inside until 9:17 AM IST if it starts early.
-#   Deduplication via data/last_alert.json prevents double-sends.
+# PRIMARY alerting is now handled by the Cloudflare Worker cron, which fires at
+# exactly 9:17 AM IST and 4:00 PM IST and sends Telegram directly.
 #
-# Closing window: every 3 min, 9:45–9:59 AM UTC + 10:00–10:45 AM UTC
-#   = 3:15–4:15 PM IST (market closes 3:30 PM IST, alert fires at 4:00 PM IST)
-#   Script sleeps inside until 4:00 PM IST if it starts early.
+# These GitHub Actions scheduled runs are a BACKUP in case the Worker fails.
+# They check data/last_alert.json — if the Worker already sent, they no-op.
+# The wide windows + frequent crons ensure the backup catches any Worker failure.
 #
-# Telegram commands are handled entirely by the Cloudflare Worker (webhook).
-# GitHub Actions no longer polls for commands.
+# Opening backup window:  3:15 AM – 6:00 AM UTC  (8:45 AM – 11:30 AM IST)
+# Closing backup window:  9:45 AM – 12:30 PM UTC (3:15 PM – 6:00 PM IST)
 
 name: Market Alerts
 
 on:
   schedule:
-    # Opening window: every 3 min from 3:15 to 3:59 AM UTC (8:45–9:29 AM IST)
+    # ── Opening window (alert fires at 9:17 AM IST = 3:47 AM UTC) ──────────────
+    # Core: every 3 min, 3:15–4:03 AM UTC (8:45–9:33 AM IST)
     - cron: "15-59/3 3 * * 1-5"
-    # Opening window continued: 4:00–4:03 AM UTC (9:30–9:33 AM IST)
     - cron: "0-3 4 * * 1-5"
-    # Closing window: every 3 min from 9:45 to 9:59 AM UTC (3:15–3:29 PM IST)
+    # Extended tail: every 15 min, 4:15–6:00 AM UTC (9:45–11:30 AM IST)
+    # Catches runs when GitHub delays crons by 60–90+ minutes.
+    - cron: "15,30,45 4 * * 1-5"
+    - cron: "0,15,30,45 5 * * 1-5"
+    - cron: "0 6 * * 1-5"
+    # ── Closing window (alert fires at 4:00 PM IST = 10:30 AM UTC) ─────────────
+    # Core: every 3 min, 9:45–10:45 AM UTC (3:15–4:15 PM IST)
     - cron: "45-59/3 9 * * 1-5"
-    # Closing window continued: every 3 min from 10:00 to 10:45 AM UTC (3:30–4:15 PM IST)
     - cron: "0-45/3 10 * * 1-5"
+    # Extended tail: every 15 min, 11:00 AM–12:30 PM UTC (4:30–6:00 PM IST)
+    - cron: "0,15,30,45 11 * * 1-5"
+    - cron: "0,30 12 * * 1-5"
 
   # Allow manual triggering from the GitHub Actions tab in your browser
   workflow_dispatch:
@@ -98,6 +103,10 @@ jobs:
       # Step 5: Commit data files back to the repo so they persist across runs.
       # - data/watchlist.json: updated by /add and /remove commands
       # - data/last_alert.json: deduplication state (which alerts were sent today)
+      #
+      # Pull before push so concurrent runs don't overwrite each other's state.
+      # Example race: opening run commits opening=true; closing run checked out
+      # before that commit and would otherwise reset opening back to false.
       - name: Commit data files (if changed)
         run: |
           git config user.name "market-alerts-bot"
@@ -108,5 +117,6 @@ jobs:
             echo "No data changes — nothing to commit"
           else
             git commit -m "Update bot data [skip ci]"
+            git pull --rebase origin main
             git push
           fi
