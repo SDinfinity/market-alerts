@@ -13,10 +13,23 @@ compatibility_date = "2024-01-01"
 GITHUB_OWNER = "SDinfinity"
 GITHUB_REPO  = "market-alerts"
 
+# ── KV Namespace ─────────────────────────────────────────────────────────────
+# Stores deduplication state (which alerts were sent today).
+# Using KV instead of GitHub API keeps the critical alert path fully
+# Cloudflare-native: sub-millisecond reads/writes, no external dependency.
+#
+# One-time setup — run this once, then paste the id below:
+#   cd worker && wrangler kv:namespace create "MARKET_ALERTS_KV"
+#
+# For local dev with wrangler dev, also add a preview_id:
+#   cd worker && wrangler kv:namespace create "MARKET_ALERTS_KV" --preview
+[[kv_namespaces]]
+binding    = "MARKET_ALERTS_KV"
+id         = "946c383b986f46cb8f6905b8ce03335a"
+
 # ── Cron Triggers ────────────────────────────────────────────────────────────
-# Worker fires at exact alert times and sends Telegram directly — no GitHub
-# Actions in the critical path. GitHub Actions crons remain as a backup;
-# deduplication via last_alert.json prevents double-sends.
+# Worker fires at exact alert times and sends Telegram directly.
+# GitHub Actions crons remain as a single-shot last-resort backup only.
 #
 # 3:47 AM UTC  = 9:17 AM IST  → opening alert
 # 10:30 AM UTC = 4:00 PM IST  → closing alert
@@ -24,7 +37,7 @@ GITHUB_REPO  = "market-alerts"
 crons = ["47 3 * * 1-5", "30 10 * * 1-5"]
 
 # ── Secrets (set via CLI, NOT stored here) ───────────────────────────────────
-# Run these three commands once after deploying:
+# Run these commands once after deploying:
 #
 #   wrangler secret put TELEGRAM_BOT_TOKEN
 #   wrangler secret put TELEGRAM_CHAT_ID

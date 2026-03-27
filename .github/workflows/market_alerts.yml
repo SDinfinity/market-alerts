@@ -1,37 +1,32 @@
 # GitHub Actions workflow for the Market Alerts Bot.
 #
-# PRIMARY alerting is now handled by the Cloudflare Worker cron, which fires at
-# exactly 9:17 AM IST and 4:00 PM IST and sends Telegram directly.
+# PRIMARY alerting is handled by the Cloudflare Worker cron triggers, which
+# fire at exactly 9:17 AM IST and 4:00 PM IST and send Telegram directly.
+# Dedup state lives in Cloudflare KV — no GitHub API in the Worker's hot path.
 #
-# These GitHub Actions scheduled runs are a BACKUP in case the Worker fails.
-# They check data/last_alert.json — if the Worker already sent, they no-op.
-# The wide windows + frequent crons ensure the backup catches any Worker failure.
+# These scheduled runs are a single-shot LAST-RESORT backup only.
+# They fire once, 23 minutes after each expected alert time. Before running
+# the Python bot, each job queries the Worker's GET / status endpoint; if the
+# Worker already sent, the job exits immediately with no Telegram message sent.
 #
-# Opening backup window:  3:15 AM – 6:00 AM UTC  (8:45 AM – 11:30 AM IST)
-# Closing backup window:  9:45 AM – 12:30 PM UTC (3:15 PM – 6:00 PM IST)
+# Backup fires at:
+#   4:10 AM UTC  = 9:40 AM IST  → opening backup  (23 min after Worker)
+#   10:50 AM UTC = 4:20 PM IST  → closing backup  (20 min after Worker)
+#
+# PREREQUISITE — set these in GitHub → Settings → Secrets and variables:
+#   Secrets:   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+#   Variables: WORKER_URL  (e.g. https://market-alerts-bot.<subdomain>.workers.dev)
 
 name: Market Alerts
 
 on:
   schedule:
-    # ── Opening window (alert fires at 9:17 AM IST = 3:47 AM UTC) ──────────────
-    # Core: every 3 min, 3:15–4:03 AM UTC (8:45–9:33 AM IST)
-    - cron: "15-59/3 3 * * 1-5"
-    - cron: "0-3 4 * * 1-5"
-    # Extended tail: every 15 min, 4:15–6:00 AM UTC (9:45–11:30 AM IST)
-    # Catches runs when GitHub delays crons by 60–90+ minutes.
-    - cron: "15,30,45 4 * * 1-5"
-    - cron: "0,15,30,45 5 * * 1-5"
-    - cron: "0 6 * * 1-5"
-    # ── Closing window (alert fires at 4:00 PM IST = 10:30 AM UTC) ─────────────
-    # Core: every 3 min, 9:45–10:45 AM UTC (3:15–4:15 PM IST)
-    - cron: "45-59/3 9 * * 1-5"
-    - cron: "0-45/3 10 * * 1-5"
-    # Extended tail: every 15 min, 11:00 AM–12:30 PM UTC (4:30–6:00 PM IST)
-    - cron: "0,15,30,45 11 * * 1-5"
-    - cron: "0,30 12 * * 1-5"
+    # Single-shot opening backup: 4:10 AM UTC = 9:40 AM IST
+    - cron: "10 4 * * 1-5"
+    # Single-shot closing backup: 10:50 AM UTC = 4:20 PM IST
+    - cron: "50 10 * * 1-5"
 
-  # Allow manual triggering from the GitHub Actions tab in your browser
+  # Manual trigger from the GitHub Actions tab — for testing and forced sends
   workflow_dispatch:
     inputs:
       mode:
@@ -50,69 +45,85 @@ on:
 jobs:
   run-alerts:
     runs-on: ubuntu-latest
-    # Allow this job to read and write to the repository (for watchlist and dedup updates)
     permissions:
-      contents: write
+      contents: write   # needed to commit data/last_alert.json after a backup send
 
     steps:
-      # Step 1: Download the latest code from your GitHub repository
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Step 2: Set up Python 3.11
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
 
-      # Step 3: Install all required Python packages
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # Step 4: Run the bot
-      # In normal (scheduled) mode, the bot decides what to do based on current time.
-      # In manual mode, it uses whatever you selected from the dropdown.
       - name: Run market alerts bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           MODE="${{ github.event.inputs.mode }}"
-          if [ -z "$MODE" ] || [ "$MODE" = "normal" ]; then
-            echo "Running in normal (scheduled) mode"
-            python src/main.py
-          elif [ "$MODE" = "opening" ]; then
-            echo "Running forced opening alert"
-            python src/main.py --opening
-          elif [ "$MODE" = "closing" ]; then
-            echo "Running forced closing alert"
-            python src/main.py --closing
-          elif [ "$MODE" = "test" ]; then
-            echo "Running test mode (sends both alerts)"
-            python src/main.py --test
-          elif [ "$MODE" = "dry-run" ]; then
-            echo "Running dry run (prints messages, no Telegram send)"
-            python src/main.py --dry-run
-          elif [ "$MODE" = "commands" ]; then
-            echo "Commands are handled by Cloudflare Worker — nothing to do"
-            python src/main.py --commands
+
+          # ── Manual dispatch: run exactly the mode the user selected ──────────
+          if [ -n "$MODE" ] && [ "$MODE" != "normal" ]; then
+            case "$MODE" in
+              opening)  python src/main.py --opening  ;;
+              closing)  python src/main.py --closing  ;;
+              test)     python src/main.py --test     ;;
+              dry-run)  python src/main.py --dry-run  ;;
+              commands) echo "Commands are handled by Cloudflare Worker — nothing to do"
+                        python src/main.py --commands ;;
+            esac
+            exit 0
           fi
+
+          # ── Scheduled / normal run: this is the last-resort backup ───────────
+          # Determine which alert window we are in based on UTC hour.
+          UTC_HOUR=$((10#$(date -u +"%H")))
+          if [ "$UTC_HOUR" -lt 9 ]; then
+            ALERT_TYPE="opening"
+          else
+            ALERT_TYPE="closing"
+          fi
+
+          echo "Backup run: checking whether Worker already sent ${ALERT_TYPE} alert..."
+
+          # Query the Worker's status endpoint (GET /).
+          # If the endpoint is unreachable (Cloudflare down), WORKER_STATUS will
+          # be '{}' and we fall through to the Python backup — correct behaviour.
+          WORKER_URL="${{ vars.WORKER_URL }}"
+          TODAY_IST=$(TZ="Asia/Kolkata" date +"%Y-%m-%d")
+          WORKER_STATUS=$(curl -sf --max-time 10 "${WORKER_URL}/" 2>/dev/null || echo '{}')
+
+          ALREADY_SENT=$(echo "$WORKER_STATUS" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+sent = d.get('date') == '$TODAY_IST' and d.get('$ALERT_TYPE', False)
+print('true' if sent else 'false')
+" 2>/dev/null || echo "false")
+
+          if [ "$ALREADY_SENT" = "true" ]; then
+            echo "Worker already sent ${ALERT_TYPE} alert — skipping backup"
+            exit 0
+          fi
+
+          echo "Worker did not send ${ALERT_TYPE} alert — running Python backup"
+          python src/main.py --${ALERT_TYPE}
         working-directory: ${{ github.workspace }}
 
-      # Step 5: Commit data files back to the repo so they persist across runs.
-      # - data/watchlist.json: updated by /add and /remove commands
-      # - data/last_alert.json: deduplication state (which alerts were sent today)
-      #
-      # Pull before push so concurrent runs don't overwrite each other's state.
-      # Example race: opening run commits opening=true; closing run checked out
-      # before that commit and would otherwise reset opening back to false.
+      # Commit data/last_alert.json if the Python backup actually sent an alert.
+      # This keeps a record in the repo and prevents re-sends if this job is
+      # manually re-run on the same day.
       - name: Commit data files (if changed)
         run: |
           git config user.name "market-alerts-bot"
           git config user.email "bot@market-alerts"
-          git add data/watchlist.json
           if [ -f data/last_alert.json ]; then git add data/last_alert.json; fi
+          git add data/watchlist.json
           if git diff --staged --quiet; then
             echo "No data changes — nothing to commit"
           else

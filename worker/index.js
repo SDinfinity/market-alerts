@@ -8,7 +8,9 @@
  *    Telegram alerts directly — no GitHub Actions in the critical path.
  *      3:47 AM UTC  = 9:17 AM IST  → opening alert
  *      10:30 AM UTC = 4:00 PM IST  → closing alert
- *    Dedup state is stored in data/last_alert.json on GitHub.
+ *    Dedup state is stored in Cloudflare KV (MARKET_ALERTS_KV binding).
+ *    A GET / endpoint exposes current dedup state so the GitHub Actions
+ *    backup can skip its Python run when the Worker already sent.
  *
  * 2. TELEGRAM WEBHOOK (HTTP POST — command handling):
  *    Handles bot commands instantly:
@@ -25,6 +27,9 @@
  *
  * Variables in wrangler.toml (not secrets):
  *   GITHUB_OWNER, GITHUB_REPO
+ *
+ * KV namespace (wrangler.toml [[kv_namespaces]]):
+ *   MARKET_ALERTS_KV    — dedup state: { date, opening, closing }
  */
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -594,11 +599,10 @@ function formatFailureAlert() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GitHub API helpers
+// GitHub API helpers (watchlist only — dedup state lives in KV)
 // ─────────────────────────────────────────────────────────────────────────────
 
-const WATCHLIST_PATH   = "data/watchlist.json";
-const LAST_ALERT_PATH  = "data/last_alert.json";
+const WATCHLIST_PATH = "data/watchlist.json";
 
 function githubHeaders(env) {
   return {
@@ -637,40 +641,21 @@ async function githubPut(env, watchlist, sha) {
   }
 }
 
-/**
- * Reads data/last_alert.json from GitHub for dedup checking.
- * Returns { state, sha } — state is {} if the file doesn't exist yet.
- */
-async function githubGetLastAlert(env) {
-  const url = `https://api.github.com/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/contents/${LAST_ALERT_PATH}`;
-  const res = await fetch(url, { headers: githubHeaders(env) });
-  if (!res.ok) return { state: {}, sha: null };
-  const data = await res.json();
-  const state = JSON.parse(atob(data.content.replace(/\n/g, "")));
-  return { state, sha: data.sha };
+// ─────────────────────────────────────────────────────────────────────────────
+// KV helpers — dedup state: { date: "YYYY-MM-DD", opening: bool, closing: bool }
+// ─────────────────────────────────────────────────────────────────────────────
+
+const KV_LAST_ALERT_KEY = "last_alert";
+
+/** Reads dedup state from KV. Returns {} if the key doesn't exist yet. */
+async function kvGetLastAlert(env) {
+  const raw = await env.MARKET_ALERTS_KV.get(KV_LAST_ALERT_KEY);
+  return raw ? JSON.parse(raw) : {};
 }
 
-/**
- * Writes data/last_alert.json to GitHub to record that an alert was sent.
- * Uses [skip ci] so this commit doesn't re-trigger GitHub Actions.
- */
-async function githubPutLastAlert(env, state, sha) {
-  const url = `https://api.github.com/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/contents/${LAST_ALERT_PATH}`;
-  const body = {
-    message: "Update bot data [skip ci]",
-    content: btoa(JSON.stringify(state, null, 2) + "\n"),
-  };
-  if (sha) body.sha = sha;
-
-  const res = await fetch(url, {
-    method: "PUT",
-    headers: { ...githubHeaders(env), "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const err = await res.text();
-    console.error(`Failed to update last_alert.json: ${res.status} ${err}`);
-  }
+/** Writes dedup state to KV. */
+async function kvPutLastAlert(env, state) {
+  await env.MARKET_ALERTS_KV.put(KV_LAST_ALERT_KEY, JSON.stringify(state));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -886,11 +871,11 @@ export default {
    *
    * Steps:
    *   1. Skip if today is not a trading day.
-   *   2. Read last_alert.json from GitHub — skip if already sent today.
-   *   3. Read watchlist from GitHub.
+   *   2. Read dedup state from KV — skip if already sent today.
+   *   3. Read watchlist from GitHub (graceful: falls back to indices only).
    *   4. Fetch market data (NSE primary, Yahoo Finance fallback).
    *   5. Format and send Telegram message.
-   *   6. Write last_alert.json back to GitHub to mark as sent.
+   *   6. Write dedup state back to KV to mark as sent.
    */
   async scheduled(event, env) {
     const utcHour = new Date(event.scheduledTime).getUTCHours();
@@ -902,25 +887,16 @@ export default {
       return;
     }
 
-    // Step 2: dedup check via GitHub last_alert.json
+    // Step 2: dedup check via KV
     const today = getISTDateString();
-    let lastAlertState, lastAlertSha;
-    try {
-      const { state, sha } = await githubGetLastAlert(env);
-      lastAlertState = state;
-      lastAlertSha = sha;
-    } catch (e) {
-      console.error(`Failed to read last_alert.json: ${e.message}`);
-      lastAlertState = {};
-      lastAlertSha = null;
-    }
+    const lastAlertState = await kvGetLastAlert(env);
 
     if (lastAlertState.date === today && lastAlertState[alertType]) {
       console.log(`${alertType}: already sent today — skipping`);
       return;
     }
 
-    // Step 3: read watchlist
+    // Step 3: read watchlist from GitHub
     let watchlist = [];
     try {
       const { watchlist: wl } = await githubGet(env);
@@ -948,19 +924,33 @@ export default {
     await sendTelegram(env.TELEGRAM_BOT_TOKEN, env.TELEGRAM_CHAT_ID, message);
     console.log(`${alertType} alert sent`);
 
-    // Step 6: mark as sent in last_alert.json
+    // Step 6: mark as sent in KV
     const newState = lastAlertState.date === today
       ? { ...lastAlertState, [alertType]: true }
       : { date: today, opening: false, closing: false, [alertType]: true };
 
-    await githubPutLastAlert(env, newState, lastAlertSha);
+    await kvPutLastAlert(env, newState);
   },
 
   /**
-   * HTTP handler — Telegram webhook for bot commands.
-   * Unchanged from the original implementation.
+   * HTTP handler — two roles:
+   *
+   * GET /  → Returns current KV dedup state as JSON.
+   *          Used by the GitHub Actions backup to check whether the Worker
+   *          already sent before running the Python fallback.
+   *          Example response: {"date":"2026-03-27","opening":true,"closing":false}
+   *
+   * POST / → Telegram webhook for bot commands (/add, /remove, /list, …).
    */
   async fetch(request, env) {
+    // Status endpoint — let the GitHub Actions backup check dedup state
+    if (request.method === "GET") {
+      const state = await kvGetLastAlert(env);
+      return new Response(JSON.stringify(state), {
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
     if (request.method !== "POST") {
       return new Response("OK", { status: 200 });
     }
